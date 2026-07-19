@@ -22,3 +22,7 @@ Thumbs.db
 # Editor/IDE folders
 .vscode/
 .idea/
+
+# Datasets folder and notebook for data exploration
+Datasets/
+datasets.ipynb

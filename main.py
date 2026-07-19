@@ -26,7 +26,7 @@ import pandas as pd
 from rich.console import Console
 from rich.markdown import Markdown
 
-from agent import run_eda_agent, ground_truth_summary
+from eda_agent import run_eda_agent, ground_truth_summary
 from continue_conversation import continue_conversation
 from report_verify import verify_report, flag_stale_numeric_recall
 

@@ -3,3 +3,4 @@ numpy
 scipy
 groq
 rich
+pytest

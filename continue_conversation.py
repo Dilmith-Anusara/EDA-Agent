@@ -1,4 +1,4 @@
-from agent import call_with_retry, tools, execute_python, missingness_report, compute, MAX_ITERATIONS, extract_code_from_tool_use_error
+from eda_agent import call_with_retry, tools, execute_python, missingness_report, compute, MAX_ITERATIONS, extract_code_from_tool_use_error
 import numpy as np
 import pandas as pd
 import json
