@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables / secrets -- GROQ_API_KEY must never be committed.
+# You're setting it via `setx` (system environment variable), not a file,
+# but this covers you if you ever switch to a .env file later.
+.env
+*.env
+
+# Jupyter notebook checkpoints, if you keep any .ipynb files around
+.ipynb_checkpoints/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE folders
+.vscode/
+.idea/
