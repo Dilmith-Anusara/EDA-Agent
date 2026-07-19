@@ -118,7 +118,7 @@ def main():
     detail_sections = []   # goes into verification_details.md -- audit trail
 
     # --- 1. Load your dataset -----------------------------------------
-    df = pd.read_csv("your_dataset.csv")
+    df = pd.read_csv("Datasets/crime_incidents_clean.csv")
 
     # --- 2. Run the agent -----------------------------------------------
     report, audit_log, messages = run_eda_agent(df)
