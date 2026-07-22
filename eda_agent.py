@@ -273,6 +273,38 @@ def compute(expression: str = None, namespace: dict = None, expressions: list = 
 
 
 # ---------------------------------------------------------------------------
+# COVERAGE GATE — module-level, defined once, not re-created every loop
+# iteration. Deliberately crude pattern-matching on the `code` string logged
+# for each audit_log entry, not semantic understanding of what the code
+# does -- same philosophy as extract_code_from_tool_use_error's regex
+# fallback above: cheap and mechanical, good enough to catch "this category
+# of check never happened at all," not meant to verify the check was done
+# well. Exists because prompt-only instructions (rule 7 asking the model to
+# self-assess "enough evidence", rule 9 asking it not to state unverified
+# numbers) have now failed under soft phrasing on this exact behavior more
+# than once -- see README Finding #9 and the compute() docstring's note on
+# tool_choice="required" being non-viable. This is the structural backstop,
+# not a fourth rewording of the same prompt rule.
+# ---------------------------------------------------------------------------
+
+REQUIRED_CHECKS = {
+    "missingness": lambda log: any("missingness_report" in e["code"] for e in log),
+    "cardinality/skew": lambda log: any(
+        ".skew(" in e["code"] or "nunique(" in e["code"] for e in log
+    ),
+    "class_balance_or_id_check": lambda log: any(
+        "value_counts" in e["code"] or "compute(" in e["code"] for e in log
+    ),
+}
+
+
+def missing_coverage(audit_log):
+    """Return the list of REQUIRED_CHECKS names that have no matching
+    audit_log entry yet. Empty list means full coverage."""
+    return [name for name, check in REQUIRED_CHECKS.items() if not check(audit_log)]
+
+
+# ---------------------------------------------------------------------------
 # TOOL SCHEMA — Groq/OpenAI format: a plain dict, not genai.protos objects.
 # ---------------------------------------------------------------------------
 
@@ -425,6 +457,15 @@ You have three tools:
   reason missingness_report supports cols=[...].
 
 Your job:
+0. Do not treat items 1-6 below as a fixed sequence to execute
+   identically every time. After each tool call, decide whether the
+   result warrants a follow-up before moving to the next item: e.g. an
+   extreme skew value (>3 or <-3), an unexpected concentration of one
+   category, or a count that contradicts an earlier result. If so,
+   investigate that specific thing with another tool call before
+   continuing. Two runs on different datasets should not produce the
+   same tool-call sequence unless the datasets are genuinely
+   equivalent in structure.
 1. Inspect shape, dtypes, missing values, and basic stats.
 2. Before interpreting skewness or applying any transformation advice,
    check df[col].nunique() for each numeric column. Columns with only 2
@@ -479,9 +520,13 @@ Your job:
     for numeric columns, but not for object columns — so for any
     object/categorical column, call missingness_report(col) rather than
     subtracting its missing count from the total row count by hand.
-7. When you have enough evidence, STOP calling the tool and write a final
-   markdown report with: dataset shape, key alerts, missing-data
-   recommendations (with your reasoning), and suggested next steps.
+7. Do not stop and write a final report until you have made at least one
+   tool call covering EACH of: missing values, numeric cardinality/skew,
+   class balance or ID-check (if a target-like or high-cardinality column
+   exists). "Enough evidence" means these categories are covered, not
+   that you feel satisfied — the loop will reject an incomplete report
+   and ask you to continue, so there is no benefit to guessing instead
+   of calling the tool.
 8. Before finalizing the report, check that every number is stated consistently everywhere it appears —
    a report that states a value correctly in one section and contradicts it in another is a failure this system prompt should catch.
 9. Never state a specific count, percentage, or class-balance figure (e.g.
@@ -493,7 +538,11 @@ Your job:
    before stating it — do not restate a number from memory, even if you
    are confident it is correct. A specific number that turns out to be
    wrong is a more serious error than an unverified-but-correct one, and
-   this rule exists specifically to prevent that.
+   this rule exists specifically to prevent that. This applies with extra
+   force to well-known public datasets you may recognize (e.g. Adult/
+   Census Income, Titanic, Iris) — recalling a published statistic about
+   a dataset is the same violation as computing one from memory, and is
+   more dangerous because it doesn't require looking at df at all.
 10. When you state a number in the final report that came directly from
     a tool result (not restated from memory — see rule 9), tag it with
     the step that produced it, immediately after the number, like this:
@@ -602,7 +651,32 @@ def run_eda_agent(df: pd.DataFrame, verbose: bool = True):
         messages.append(message.model_dump(exclude_none=True))
 
         if not message.tool_calls:
-            # No tool call -> model is done, this is the final report
+            # Model wants to stop. Before accepting this as the final report,
+            # check whether audit_log actually covers the required
+            # categories -- structural gate, not a prompt-only rule. If
+            # coverage is missing, push back and force continuation instead
+            # of returning. (Guard step < MAX_ITERATIONS - 1 so a forced
+            # continuation can never itself cause an infinite loop / never
+            # exceed MAX_ITERATIONS.)
+            gaps = missing_coverage(audit_log)
+            if gaps and step < MAX_ITERATIONS - 1:
+                if verbose:
+                    print(f"\n[Step {step}] Model tried to finalize with gaps: {gaps}. Forcing continuation.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Before finalizing, you have not yet made a tool call covering: "
+                        f"{', '.join(gaps)}. Do not state any figures for these categories "
+                        f"in your report unless you verify them now with a tool call -- "
+                        f"this includes figures you may recognize from a well-known public "
+                        f"dataset, which must still be freshly verified against THIS "
+                        f"dataframe, not recalled. Either continue your investigation to "
+                        f"cover the missing categories, or write the report omitting those "
+                        f"sections entirely."
+                    ),
+                })
+                continue
+
             if verbose:
                 print(f"\n[Step {step}] Model produced final report (no more tool calls).")
             return message.content, audit_log, messages
