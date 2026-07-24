@@ -125,6 +125,24 @@ THRESHOLD_CONTEXT_RE = re.compile(
     r"[<>" + UNICODE_COMPARISON_CHARS + r"]=?\s*$"
 )
 
+# Bare, un-braced "step N" / "Step N" / "(step 7)" mentions in prose --
+# the model's system prompt specifies the {{step:N}} tag convention, but
+# it doesn't reliably hold to that exact syntax; it sometimes writes the
+# citation as plain prose instead ("...66.48% unique, step 7)"). Confirmed
+# on a live run: strip_citation_tags' brace-only regex left the bare "7"
+# in "step 7" untouched, so it survived into flag_internal_contradictions
+# as ordinary text, got tagged "nunique" (the word "unique" sits right
+# next to it), and got attributed to the nearest preceding column
+# (fnlwgt) -- fabricating a false fnlwgt=66.48-vs-7 contradiction. Worse,
+# flag_unverified_numbers didn't catch the bare 7 either, because 7
+# coincidentally IS a real verified value elsewhere (marital_status has 7
+# uniques) -- exactly the "coincidentally-matching number" limitation this
+# module's own docstring already warns about. Recognizing bare step-
+# mentions as citation metadata (same status as a {{step:N}} tag, not a
+# second data claim) closes both gaps in one place, since both checks
+# already consume the same stripped text.
+BARE_STEP_MENTION_RE = re.compile(r"\(?\bstep\s*#?\s*\d+(?:\s*,\s*\d+)*\)?", re.IGNORECASE)
+
 
 def _normalize_number_spacing(text: str) -> str:
     """Collapse space-grouped thousands (using any recognized Unicode
@@ -718,11 +736,24 @@ CITATION_TAG_RE = re.compile(r"\{\{step:\s*(\d+(?:\s*,\s*\d+)*)\s*\}\}")
 
 
 def strip_citation_tags(text: str) -> str:
-    """Remove {{step:N}} tags before handing text to the existing
-    whole-log checks, so a tag's own digits are never mistaken for a bare
-    unverified number (a citation tag is metadata about a claim, not a
-    second claim of its own)."""
-    return CITATION_TAG_RE.sub("", text)
+    """Remove {{step:N}} tags AND bare 'step N' prose mentions before
+    handing text to the existing whole-log checks, so neither form's
+    digits are ever mistaken for a bare unverified number (both are
+    metadata about a claim's provenance, not a second claim of their own).
+
+    The bare-mention removal was added after a confirmed live failure:
+    the model wrote "step 7" as plain prose instead of the {{step:N}}
+    convention its own system prompt specifies. The brace-only regex left
+    that "7" untouched, and it went on to fabricate a false contradiction
+    in flag_internal_contradictions (tagged as a second "nunique" value
+    for the nearest preceding column) and slipped past
+    flag_unverified_numbers entirely (7 coincidentally matched an
+    unrelated column's real unique-count). See BARE_STEP_MENTION_RE's own
+    comment for the full trace.
+    """
+    text = CITATION_TAG_RE.sub("", text)
+    text = BARE_STEP_MENTION_RE.sub("", text)
+    return text
 
 
 def _preceding_number_match(line: str, tag_start: int):
@@ -793,7 +824,13 @@ def flag_citation_mismatches(report: str, audit_log):
 
     A number with NO tag is not flagged here at all -- that's what
     flag_unverified_numbers (on tag-stripped text) is still for. This
-    check only judges claims the model chose to cite.
+    check only judges claims the model chose to cite via the {{step:N}}
+    convention specifically -- bare "step N" prose mentions are handled
+    upstream (see strip_citation_tags / BARE_STEP_MENTION_RE): they're
+    removed before flag_unverified_numbers/flag_internal_contradictions
+    ever see them, but they're NOT verified against audit_log here either,
+    since a bare mention doesn't commit to the same precise, checkable
+    provenance claim a real {{step:N}} tag does.
 
     Threshold references ("per rule >10") are excluded the same way
     flag_unverified_numbers already excludes them -- confirmed missing
@@ -850,8 +887,9 @@ def verify_report(report: str, audit_log, df_columns=None):
     print("AUTOMATED REPORT VERIFICATION")
     print("=" * 60)
 
-    # Strip {{step:N}} tags before the existing whole-log checks -- a
-    # tag's own digits are metadata about a claim, not a second claim.
+    # Strip {{step:N}} tags AND bare "step N" prose mentions before the
+    # existing whole-log checks -- both are metadata about a claim's
+    # provenance, not a second claim of their own.
     untagged_report = strip_citation_tags(report)
 
     unverified_numbers = flag_unverified_numbers(untagged_report, audit_log)

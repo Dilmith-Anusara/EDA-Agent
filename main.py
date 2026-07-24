@@ -7,9 +7,10 @@ Produces TWO files, deliberately split by audience:
                                 checker debug output.
   - verification_details.md -- ground truth + the full raw verification
                                 output (citation slips, unverified-token
-                                lists, etc.). Read only if the banner
-                                flags something, or to double-check the
-                                checker itself.
+                                lists, etc.) + the raw audit-log trail of
+                                every tool call the agent made. Read only
+                                if the banner flags something, or to
+                                double-check the checker itself.
 
 Run with:
     python main.py
@@ -43,6 +44,37 @@ def capture_stdout(func, *args, **kwargs):
     with contextlib.redirect_stdout(buffer):
         return_value = func(*args, **kwargs)
     return buffer.getvalue(), return_value
+
+
+def render_audit_log(audit_log: list) -> str:
+    """Render the agent's raw tool-call trail (audit_log) as readable
+    markdown, independent of whatever run_eda_agent's own `verbose`
+    printing happens to produce.
+
+    This exists because run_eda_agent(df) was the only one of the three
+    pipeline calls (ground_truth_summary, verify_report, run_eda_agent)
+    NOT wrapped in capture_stdout -- its verbose=True print output went
+    straight to the terminal and was never written to either output
+    file. audit_log itself (the structured list of {step, code, result}
+    dicts) was always kept correctly in memory and used by verify_report
+    for its checks -- it just never got a human-readable, saved form of
+    its own. Building this directly off the structured list rather than
+    capturing run_eda_agent's printed stdout means this rendering doesn't
+    depend on verbose staying True, and won't silently break if that
+    printed format ever changes for debugging purposes.
+    """
+    if not audit_log:
+        return "_No tool calls were recorded for this run._"
+
+    lines = []
+    for entry in audit_log:
+        lines.append(f"### Step {entry['step']}")
+        lines.append("**Called:**")
+        lines.append(f"```\n{entry['code']}\n```")
+        lines.append("**Result:**")
+        lines.append(f"```\n{entry['result']}\n```")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def build_trust_banner(verify_result: dict, stale_flags: list = None) -> str:
@@ -122,6 +154,15 @@ def main():
 
     # --- 2. Run the agent -----------------------------------------------
     report, audit_log, messages = run_eda_agent(df)
+
+    # --- 2b. Raw tool-call trail -- built directly from the structured
+    # audit_log list, not captured stdout. This is the piece that was
+    # previously printed to the terminal (via run_eda_agent's own
+    # verbose=True) and never written to either output file. Goes to the
+    # detail file, same audience as ground truth and the full verification
+    # printout -- not the analyst-facing report.
+    audit_trail_text = render_audit_log(audit_log)
+    detail_sections.append(("Raw Tool-Call Trail (audit_log)", audit_trail_text))
 
     # --- 3. Ground truth -- captured, goes to the detail file, not the
     # analyst-facing one (it's a developer/validation artifact, not

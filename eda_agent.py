@@ -259,6 +259,35 @@ def compute(expression: str = None, namespace: dict = None, expressions: list = 
     for expr in target_exprs:
         try:
             result = eval(expr, {"__builtins__": __builtins__}, namespace)
+        except SyntaxError:
+            # Common failure mode: the model writes a bare comprehension/
+            # generator like "df[col].nunique() for col in df.columns"
+            # with no enclosing brackets -- valid as an argument to a
+            # function call, invalid as a standalone eval() expression.
+            # Auto-repair by wrapping in [...] and retrying ONCE. This is
+            # safe because bracket-wrapping only fixes syntax, it cannot
+            # change what gets computed -- unlike auto-correcting the
+            # actual logic, which would be a substance change and is not
+            # something this function should ever do silently.
+            if " for " in expr and not expr.strip().startswith(("[", "(", "{")):
+                repaired = f"[{expr}]"
+                try:
+                    result = eval(repaired, {"__builtins__": __builtins__}, namespace)
+                    lines.append(
+                        f"(auto-repaired unparenthesized comprehension -> "
+                        f"{repaired})\n{repaired} = {result!r}"
+                    )
+                    continue
+                except Exception:
+                    pass
+            lines.append(
+                f"ERROR evaluating '{expr}':\n{traceback.format_exc()}\n"
+                f"HINT: if this was meant to be a list comprehension across "
+                f"columns/values, wrap the whole thing in square brackets, "
+                f"e.g. \"[df[c].nunique() for c in df.columns]\" -- a bare "
+                f"'for ... in ...' is not valid as a standalone expression."
+            )
+            continue
         except Exception:
             lines.append(f"ERROR evaluating '{expr}':\n{traceback.format_exc()}")
             continue
@@ -292,9 +321,17 @@ REQUIRED_CHECKS = {
     "cardinality/skew": lambda log: any(
         ".skew(" in e["code"] or "nunique(" in e["code"] for e in log
     ),
-    "class_balance_or_id_check": lambda log: any(
-        "value_counts" in e["code"] or "compute(" in e["code"] for e in log
-    ),
+    # Deliberately NOT "or compute(" here -- that used to accept ANY
+    # compute() call as satisfying this check, including the unrelated
+    # nunique-percentage calls already made for section 3. That loophole
+    # meant a model that never touched value_counts on the target column
+    # could still pass this gate, which is exactly what let two live runs
+    # recite class-balance percentages from memory with no nudge to verify
+    # them -- the gate reported zero gaps before the model ever ran a real
+    # class-balance check. Only "value_counts" (whether it appears inside
+    # an execute_python call or inside a compute() expression string --
+    # this matches either) actually demonstrates the check happened.
+    "class_balance": lambda log: any("value_counts" in e["code"] for e in log),
 }
 
 
@@ -302,6 +339,36 @@ def missing_coverage(audit_log):
     """Return the list of REQUIRED_CHECKS names that have no matching
     audit_log entry yet. Empty list means full coverage."""
     return [name for name, check in REQUIRED_CHECKS.items() if not check(audit_log)]
+
+
+_STEP_CITATION_RE = re.compile(r"\{\{step:(\d+)\}\}")
+
+
+def invalid_citations(report_text, audit_log):
+    """Return the sorted list of step numbers cited in report_text via
+    {{step:N}} that do NOT correspond to any real audit_log entry.
+
+    This is the structural counterpart to rule 10 in the system prompt
+    ("only tag a number if you can actually see that step's result
+    containing it"). That rule has now failed under soft phrasing on the
+    same specific pattern across multiple separate runs (a high-
+    cardinality/ID-like-column claim getting a second, invented step
+    number appended) -- three confirmed recurrences of an identical
+    failure against clear prose is a signal to gate this structurally,
+    the same reasoning already applied to the class-balance coverage
+    gate above, not to reword rule 10 a fourth time.
+
+    Deliberately checks against the STEP NUMBER existing in audit_log at
+    all, not whether the specific number-being-cited actually appears in
+    that step's result -- report_verifier.py's existing citation checker
+    already does the harder, more precise version of that check after
+    the fact. This gate exists only to catch the cruder, cheaper-to-fix
+    case: a citation pointing at a step that was never run in the first
+    place.
+    """
+    valid_steps = {e["step"] for e in audit_log}
+    cited_steps = {int(n) for n in _STEP_CITATION_RE.findall(report_text)}
+    return sorted(cited_steps - valid_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -652,27 +719,40 @@ def run_eda_agent(df: pd.DataFrame, verbose: bool = True):
 
         if not message.tool_calls:
             # Model wants to stop. Before accepting this as the final report,
-            # check whether audit_log actually covers the required
-            # categories -- structural gate, not a prompt-only rule. If
-            # coverage is missing, push back and force continuation instead
-            # of returning. (Guard step < MAX_ITERATIONS - 1 so a forced
-            # continuation can never itself cause an infinite loop / never
-            # exceed MAX_ITERATIONS.)
+            # run TWO structural checks -- neither relies on prompt wording
+            # alone, since both categories of prompt-only rule (rule 7's
+            # "enough evidence" and rule 10's citation honesty) have now
+            # failed under soft phrasing on repeat, confirmed occasions.
             gaps = missing_coverage(audit_log)
-            if gaps and step < MAX_ITERATIONS - 1:
+            bad_citations = invalid_citations(message.content or "", audit_log)
+
+            if (gaps or bad_citations) and step < MAX_ITERATIONS - 1:
+                problems = []
+                if gaps:
+                    problems.append(
+                        f"you have not yet made a tool call covering: {', '.join(gaps)}"
+                    )
+                if bad_citations:
+                    problems.append(
+                        f"your draft cites step(s) {bad_citations} with {{{{step:N}}}} "
+                        f"tags, but no tool call in this conversation has that step "
+                        f"number -- that citation is fabricated and must be removed "
+                        f"or corrected to the real step that produced the number"
+                    )
                 if verbose:
-                    print(f"\n[Step {step}] Model tried to finalize with gaps: {gaps}. Forcing continuation.")
+                    print(f"\n[Step {step}] Model tried to finalize with problems: {problems}. Forcing continuation.")
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"Before finalizing, you have not yet made a tool call covering: "
-                        f"{', '.join(gaps)}. Do not state any figures for these categories "
-                        f"in your report unless you verify them now with a tool call -- "
-                        f"this includes figures you may recognize from a well-known public "
-                        f"dataset, which must still be freshly verified against THIS "
-                        f"dataframe, not recalled. Either continue your investigation to "
-                        f"cover the missing categories, or write the report omitting those "
-                        f"sections entirely."
+                        "Before finalizing: " + "; and ".join(problems) + ". "
+                        "Do not state any figures for uncovered categories unless "
+                        "you verify them now with a tool call -- this includes "
+                        "figures you may recognize from a well-known public "
+                        "dataset, which must still be freshly verified against "
+                        "THIS dataframe, not recalled. Fix the fabricated "
+                        "citation(s) if any, and either continue your "
+                        "investigation to cover missing categories or write the "
+                        "report omitting unverified sections."
                     ),
                 })
                 continue
