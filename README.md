@@ -1,8 +1,15 @@
 # EDA Agent: Verification Under Adversarial Testing
 ### Lab Report / Project Documentation
 
-**Author's context:** Data science undergraduate; no local compute (Google
-Colab only); free-tier API budget only (Groq).
+**Author's context:** Data science undergraduate. Originally built and
+tested entirely on Google Colab, free-tier Groq API only. **Since §2.8
+below: moved off Colab, running locally** (Windows laptop, MSI GF63,
+Python venv), git repo on GitHub (`.gitignore` created before the first
+commit — excludes `venv/`, `.venv/`, `__pycache__/`, a `Datasets/`
+folder, and `datasets.ipynb`; source datasets deliberately not
+committed). `GROQ_API_KEY` set as a system env var, never committed.
+Still free-tier Groq API budget only — that constraint hasn't changed,
+only where the code runs.
 
 **Objective.** Build an autonomous exploratory-data-analysis agent — given
 a pandas dataframe, it investigates independently (inspect → reason →
@@ -18,15 +25,17 @@ never from the agent's report "seeming" plausible.
 
 ## 1. System Architecture
 
-Three components, each with a distinct responsibility:
+Four components as of the local move (was three on Colab), each with a
+distinct responsibility:
 
 | File | Role | LLM calls? |
 |---|---|---|
 | `eda_agent.py` | Agent loop: tool-calling model investigates a dataframe and produces a report | Yes |
-| `report_verifier.py` | Post-hoc checker: audits a completed report against its own tool-call trail | **No — pure Python** |
-| `continue_conversation_snippet.py` | Sends one additional message into an already-completed conversation, reusing prior state | Yes |
+| `report_verify.py` | Post-hoc checker: audits a completed report against its own tool-call trail | **No — pure Python** |
+| `continue_conversation.py` | Sends one additional message into an already-completed conversation, reusing prior state | Yes |
+| `main.py` | Driver script — replaces the old cell-by-cell Colab workflow; runs the full pipeline end to end and writes two output files (see §2.8) | No (orchestration only) |
 
-The separation matters: `report_verifier.py` is deliberately zero-LLM.
+The separation matters: `report_verify.py` is deliberately zero-LLM.
 Every fix that has actually held up under repeated testing in this
 project has been a **structural** one — a new tool, a stricter return
 contract, a deterministic checker — never a prompt-level instruction
@@ -57,6 +66,12 @@ outputs," which is the whole basis for the findings log in §3.
   specifically to structurally close Finding #6 (§3, item 6) after
   prompt-only fixes failed to hold across repeated concrete forms of
   the same underlying failure.
+- **`compute(expression)`** — evaluates a single Python expression (or a
+  batch via `expressions=[...]`) against the same shared namespace, so
+  derived ratios/percentages have a real, logged tool call behind them
+  instead of being computed in the model's head. See §5c/§5e for full
+  design history. **Updated this round:** now includes a syntax
+  auto-repair step for bare comprehensions; see §2.9.
 
 ### 1.3 Known environment quirks
 
@@ -84,9 +99,9 @@ returned a bogus "malformed tool call" error. Fixed by dispatching on
 the actual function name.
 
 ### 2.2 Audit logging completeness
-`report_verifier.py` only trusts numbers that appear in `audit_log`. A
+`report_verify.py` only trusts numbers that appear in `audit_log`. A
 tool whose calls aren't logged causes the checker to falsely flag its
-(actually verified) output as unverified. Both tools now log
+(actually verified) output as unverified. All tools now log
 unconditionally on every call.
 
 ### 2.3 Malformed tool-call salvage (two distinct shapes)
@@ -105,7 +120,7 @@ real state — not a hand-reconstructed approximation of it — can be fed
 into `continue_conversation`. This was a functional blocker for testing
 Finding #9 under realistic follow-up conditions (§4).
 
-### 2.5 `report_verifier.py`'s own bug history
+### 2.5 `report_verify.py`'s own bug history
 The checker has been iterated on as much as the agent itself:
 
 - **Unicode thousands-separator normalization** — reports use `\u202f`,
@@ -160,7 +175,6 @@ The checker has been iterated on as much as the agent itself:
   distant numbers untagged. Final state re-validated against: the
   original bug case, both previously-passing stale-recall tests, and
   the real transcript that surfaced the bug — all four correct.
-
 - **Unicode threshold-symbol gap in `THRESHOLD_CONTEXT_RE`** — the
   regex (`[<>]=?\s*$`) only matched ASCII `<`/`>`; the model routinely
   writes `≤`/`≥` instead, so "cardinality ≤ 10" was slipping through as
@@ -306,7 +320,7 @@ The checker has been iterated on as much as the agent itself:
   the model's claim itself was imprecise, not just ambiguously
   attributed — `weapon_used` (actually 18.48% missing) doesn't belong in
   a "≈6-14%" bucket at all; only `severity` (6.76%) and `case_status`
-  (13.92%) do. `report_verifier.py` checks whether a stated number
+  (13.92%) do. `report_verify.py` checks whether a stated number
   matches something real anywhere in the log — it has no concept of
   whether a number's *grouping/bucketing* is sensible, and the current
   per-column-attribution design can't be extended to catch this without
@@ -323,57 +337,6 @@ effectively infinite space. This is the same lesson as the earlier
 unicode-glyph whack-a-mole (§2.5), generalized from "which characters"
 to "which sentence shapes." The structural fix isn't a better regex —
 it's not needing to parse prose for this fact at all. See §5g below.
-
-## 5g. Future Direction: Structured Output Instead of Free Prose
-
-**Not built. Documented here as a deliberate design direction for a
-future phase, not a task in progress.**
-
-Every attribution false positive logged above — the range-bucket bug,
-its positional-pairing cousin, its columns-before-range mirror image —
-is the same underlying tradeoff coming due repeatedly: this project
-chose (§5b) to keep the final report as human-readable free-form
-markdown, with a citation-tag convention (`{{step:N}}`) layered on top
-as a lighter-weight compromise, rather than requiring the model to
-return literal structured data. That was a deliberate choice, not an
-oversight — it keeps the report readable without redesigning the output
-format — and these recurring false positives are its cost, paid in
-small installments across many runs rather than once up front.
-
-The actual fix for the whole category, if it's ever worth doing: the
-model returns structured claims directly —
-`{"column": "weapon_used", "missing_pct": 18.48, "source_step": 2}` —
-instead of a sentence a regex has to parse to recover that same
-information. There is no attribution ambiguity to resolve, because the
-column and its value are paired by construction, not inferred from
-proximity in prose. This is the "Option B" design considered and
-deliberately deferred earlier in this project in favor of the
-citation-tag compromise; nothing has changed about the tradeoff, it's
-just accumulated enough small cost that it's worth naming explicitly as
-a real future option rather than leaving it implicit.
-
-This would be a genuine redesign (report generation, the verifier, and
-likely the prompt all change shape) — not a patch, and not something to
-bolt on reactively. If pursued, it belongs as a deliberate, scoped
-decision in its own right, most naturally after the current SE
-restructuring (tests, module split) is further along, not before.
-
-**Resolved, not a limitation:** the ratio-vs-percentage gap (§5f) —
-`compute()` returning a raw ratio that the model then multiplied by 100
-by hand outside any tool call. Fixed by folding `* 100` into the tool
-schema's own example and adding an explicit system-prompt rule (6c)
-naming the failure mode directly. Confirmed clean on **4 of 4** returned
-follow-up runs after the fix — zero recurrences of the hand-multiplication
-pattern across two separate batches, replacing a mechanism that had
-failed in every prior run. One run in the second batch generalized the
-fix beyond its original target case, folding `* 100` into `compute()`
-calls for per-category class-balance percentages, not just the
-ID-uniqueness case the fix was specifically written for — a stronger
-signal than mere non-recurrence. Per this project's own 3-strikes
-framing, a fix confirmed working 4 times in a row is not something to
-keep re-testing; treating this as closed.
-
----
 
 ### 2.6 Wide-dataset scaling limitation and fix
 Discovered running the agent against a 33-column real-world dataset
@@ -414,8 +377,6 @@ re-run**: the model used `missingness_report(cols=[...])` for all 12
 columns in a single call, unprompted, on its very first tool call of the
 run. Finding #10 marked confirmed in §3.
 
----
-
 ### 2.7 Dataframe mutation leak — ground truth was not actually independent
 Discovered on the 12-column police-data run, and arguably the most
 consequential bug found in this project: `run_eda_agent`'s internal
@@ -452,6 +413,194 @@ original `(5250, 12)` despite the agent again deriving new columns
 mid-run — no contamination, on a run that also produced the Finding #4
 multi-step evidence above.
 
+### 2.8 `main.py` and the missing audit-trail capture
+
+Moving off Colab meant the cell-by-cell workflow (`run_eda_agent` →
+`ground_truth_summary` → `verify_report` → optional
+`continue_conversation`) needed a real driver script instead of manually
+run notebook cells. `main.py` was built to do this, and — per direct
+user pushback ("why should an analyst read raw checker debug output") —
+deliberately splits output by audience into two files:
+
+- `full_run_report.md` — the agent's report plus a short trust banner
+  (`build_trust_banner`), nothing else. What an analyst reads.
+- `verification_details.md` — ground truth, full raw verifier output,
+  and (as of this fix) the raw tool-call trail. Read only if the banner
+  flags something, or to validate the harness itself.
+
+**Bug found:** `ground_truth_summary` and `verify_report` were both
+wrapped in `capture_stdout` so their printed output gets saved to
+`verification_details.md`. `run_eda_agent(df)` — running with its own
+`verbose=True` default — was the one call **not** wrapped. Its
+step-by-step `[Step N] MODEL CALLED ... / RESULT: ...` trail printed
+straight to the terminal and was never written to either file. Not a
+deliberate exclusion — the raw trail belongs in `verification_details.md`
+by the file's own stated purpose — just a gap introduced when the
+Colab-cell workflow (where "printed" and "saved" were effectively the
+same thing, since the notebook itself was the artifact) became a
+standalone script (where they're not).
+
+**Fix:** `render_audit_log(audit_log)` builds a markdown rendering
+directly from the structured `audit_log` list (`step`/`code`/`result`
+keys) rather than capturing `run_eda_agent`'s printed stdout — more
+robust, and doesn't depend on `verbose` staying `True`. Added as the
+first section of `verification_details.md` (chronologically the
+earliest artifact of a run). `eda_agent.py`'s own `verbose` printing was
+left untouched — still useful for watching a run live in the terminal;
+this just stops it from being the *only* copy.
+
+### 2.9 `compute()` syntax auto-repair for bare comprehensions
+
+**Recurring error, confirmed across multiple runs:**
+```
+compute(expressions=["df[col].nunique() for col in df.columns"])
+ERROR: SyntaxError: invalid syntax
+```
+Root cause: a bare generator expression (`X for Y in Z` with no
+enclosing brackets) is valid Python only as the sole argument to a
+function call, not as a standalone `eval()` expression. The model
+clearly intends "give me this value for every column" and reaches for a
+comprehension shorthand on wide dataframes, but drops the required
+enclosing `[...]`.
+
+**Fix:** on `SyntaxError`, if the expression contains `" for "` and
+doesn't already start with a bracket, `compute()` auto-wraps it in
+`[...]` and retries once before giving up, returning
+`(auto-repaired unparenthesized comprehension -> [...])` alongside the
+result. This is safe because bracket-wrapping only fixes syntax — it
+cannot change what gets computed — unlike auto-correcting the actual
+logic, which would be a substance change and is deliberately not
+something this function does silently. Falls through to a clearer
+hint-based error message if auto-repair itself fails.
+
+**Confirmed working in production, not just in isolation:** multiple
+later runs hit the exact malformed pattern and the audit log shows the
+auto-repair firing and returning correct results each time — including
+one case that closed, in the same run, a long-standing gap where
+`fnlwgt`'s uniqueness percentage had been stated with no
+percentage-producing tool call behind it at all.
+
+### 2.10 Structural completion gates added to `run_eda_agent`
+
+Three related bugs, found and fixed in sequence, all in the same part
+of the loop (the `if not message.tool_calls:` branch where the model
+decides it's done):
+
+**2.10a — Premature stop with no coverage requirement.** The model was
+finalizing a report after as few as 4 tool-call steps, skipping class
+balance and/or ID-checking entirely, then backfilling the missing
+numbers from memory (a fifth Finding-#9-style fabrication, confirmed
+against a real Adult/Census-Income run where the recited numbers were
+the well-known published dataset statistics, not something this run's
+`df` had actually produced). Rule 7 ("stop when you have enough
+evidence") gave no operational floor for what "enough" meant.
+
+**Fix:** `REQUIRED_CHECKS` + `missing_coverage(audit_log)`, a
+module-level, crude-but-cheap pattern match on `audit_log`'s logged
+`code` strings (does *a* `missingness_report` call exist; does *a*
+`nunique(`/`.skew(` call exist; etc.). If gaps exist and iterations
+remain, the loop pushes back with an explicit message naming the
+missing categories and forces continuation instead of accepting the
+report. Rule 7 in the system prompt was reworded to match ("do not stop
+until each category is covered — the loop will reject an incomplete
+report").
+
+**Implementation bug found in the first version of this fix, before it
+ever ran:** the person implementing it defined `REQUIRED_CHECKS` and
+`missing_coverage` correctly but never called `missing_coverage` inside
+the `if not message.tool_calls:` branch — the original unconditional
+`return` was still there, untouched, right below the new dead code. The
+gate would have done nothing on a real run had it not been caught before
+testing. Fixed by moving the checks to module level (defined once, not
+redefined every loop iteration) and actually wiring `gaps =
+missing_coverage(audit_log)` into the return-vs-continue decision.
+
+**2.10b — Bundled check let the model satisfy class-balance coverage
+without ever checking class balance.** The original
+`"class_balance_or_id_check"` accepted *any* `compute()` call as
+satisfying it — including the routine cardinality-percentage `compute()`
+calls the model already makes for a different section. This meant the
+gate reported "all clear" before the model had ever touched `income`,
+so the "please verify this" nudge never fired, and the model recited the
+same well-known Adult-dataset percentages from memory a second time —
+not a defiance of a correction, but a correction that was never sent in
+the first place. **Confirmed via two live runs before the fix, one
+clean run after.**
+
+**Fix:** split into two independent checks — `cardinality/skew`
+(unchanged) and a standalone `class_balance` requiring `"value_counts"`
+specifically in the logged code, whether it appears inside an
+`execute_python` call or a `compute()` expression string. Gaming one
+category can no longer silently satisfy the other. `id_check` doesn't
+need a separate flag: its evidence (nunique counts) is already required
+by `cardinality/skew`.
+
+**2.10c — Fabricated step citations recurring across multiple runs on
+the same claim shape.** A third, independent occurrence (following two
+earlier ones logged separately) of the model appending a second,
+invented `{{step:N}}` tag to an ID-like-column claim (`{{step:7}}
+{{step:8}}` where step 8 never ran). Three recurrences of an identical
+pattern against clear prose (rule 10 already explicitly forbids
+fabricated citations) is this project's own stated threshold for
+switching from prompt wording to a structural gate — the same reasoning
+already applied to 2.10a/2.10b.
+
+**Fix:** `invalid_citations(report_text, audit_log)` extracts every
+`{{step:N}}` tag from the model's draft final report and checks the
+step number against real entries in `audit_log`, before the report is
+accepted. Wired into the same finalization branch as the coverage
+gate — a draft with either gaps or fabricated citations gets pushed
+back with a message naming the specific problem(s), rather than two
+separate rejection paths. Deliberately does **not** attempt the more
+precise version of this check (does the cited step's output actually
+*contain* this number) — that's what `report_verify.py`'s existing
+`flag_citation_mismatches` already does, correctly, after the fact;
+duplicating that logic mid-loop would be a much larger, riskier change
+for a check that already has a working home downstream.
+
+**Important limitation confirmed after these gates shipped, see §3
+Finding #16 and §5f below:** the completion gates check whether the
+*right category* of tool call happened (a `value_counts` call exists
+somewhere in the log) — they have no concept of whether that call's
+*output was correctly used* afterward (e.g. whether a returned ratio was
+converted to a percentage inside the tool call, per rule 6c, or by hand
+outside it). The gate answering "did the investigation happen" and the
+gate answering "was every downstream number derived compliantly" are
+different questions; only the first exists right now.
+
+### 2.11 `report_verify.py` — bare "step N" prose mentions
+
+**Third confirmed instance of a false-positive contradiction**, and the
+first one with a fully identified mechanism rather than a suspected
+pattern. A report stated `"fnlwgt ... (≈66.48% unique, step 7) ..."` —
+note: plain prose, not the `{{step:7}}` brace convention the system
+prompt actually specifies. `strip_citation_tags`'s regex only matched
+the braced form, so the bare `7` survived into `flag_internal_
+contradictions`, got tagged `nunique` (the word "unique" sits right next
+to it), attributed to the nearest preceding column (`fnlwgt`), and
+flagged as a second, conflicting uniqueness value against the real
+`66.48`. Compounding factor: `flag_unverified_numbers` also missed the
+bare `7` entirely, because `7` coincidentally *is* a real value elsewhere
+in the log (`marital_status` has 7 uniques) — exactly the
+"coincidentally-matching number" limitation this file's own docstring
+already warns about, now observed live rather than theoretical.
+
+**Fix:** `BARE_STEP_MENTION_RE` (`\(?\bstep\s*#?\s*\d+(?:\s*,\s*\d+)*\)?`,
+case-insensitive) added alongside the existing brace-tag regex; both are
+stripped by `strip_citation_tags` before any downstream check sees the
+text, treating a bare mention as citation metadata (not a second data
+claim) the same way a `{{step:N}}` tag already is. Verified directly:
+the exact failing sentence no longer produces a contradiction; a
+genuine, unrelated same-column same-tag contradiction (values 8+ apart)
+still fires correctly; real `{{step:N}}` tags still strip as before.
+
+**Known residual risk, not yet observed in practice:** the regex will
+also strip an unrelated sentence that happens to contain the literal
+phrase "step N" outside a citation context (e.g. "the third step 2 hours
+into preprocessing"). Considered unlikely in this report's vocabulary
+and not worth guarding against preemptively without a real case to test
+against.
+
 ---
 
 ## 3. Findings Log — Agent Behavior
@@ -473,7 +622,32 @@ stable — conflating those two tests weakens both.
 | 8 | Self-contradictory restatement: same fact stated with two different values in different report sections | Prompt rule | Confirmed fixed on cases tested — checker's own detection of this pattern required multiple rounds of its own bug-fixing (§2.5) before it could surface real instances without drowning in false positives |
 | 9 | Fabricated numeric values (not just unverified — actually wrong): stated Stock class-balance counts (`1,510`/`1,500`) that were factually incorrect (cross-confirmed real values: `1,513`/`1,497`) for a column never re-queried that run | Prompt rule → structural (see §4) | **See §4 — full case study** |
 | 10 | `MAX_ITERATIONS` ceiling on wide datasets: a 33-column dataframe hit the 15-iteration cap without ever producing a report, since `missingness_report` originally allowed one column per call — an availability/completion failure, not a correctness failure | **Structural** (`cols: list[str]` batch mode added to `missingness_report`, see §2.6) | **Confirmed** — re-run on the 12-column slice adopted batch mode unprompted on the very first tool call (a single `missingness_report(cols=[...])` covering all 12 columns) |
-| 11 | Correct-but-unverified derived arithmetic on top of already-tool-verified numbers: report stated `≈96% uniqueness` (`5050/5250`) and `139 conversion failures` (`575−436`) — both arithmetically correct, neither itself printed by any tool call | Not yet fixed | Same root behavior as Finding #6 (silent mental computation) recurring in a shape `missingness_report` doesn't cover. **Recurred on the very next run** (again `≈96% uniqueness`, same computation, same dataset property) — no longer a one-off, now a repeated pattern per §5's "3+ recurrences" threshold for switching from prompt-level to structural fix |
+| 11 | Correct-but-unverified derived arithmetic on top of already-tool-verified numbers: report stated `≈96% uniqueness` (`5050/5250`) and `139 conversion failures` (`575−436`) — both arithmetically correct, neither itself printed by any tool call | Prompt rule (6c) — see §5f/§3 Finding #16 for reopened status | Same root behavior as Finding #6 (silent mental computation) recurring in a shape `missingness_report` doesn't cover. **Was marked resolved after 4/4 clean runs (§5f) — that status is now known to be premature; see Finding #16.** |
+| 12 | Model recites well-known public-dataset statistics from memory (Adult/Census-Income class-balance split, 75.92%/24.08%) rather than computing them from `df` — a more dangerous variant of Finding #9, since it doesn't require looking at the data at all | Prompt rule (extended rule 9) + structural (coverage gate, §2.10a/b) | Confirmed fixed after the class-balance check was decoupled from the general-purpose `compute()` check (§2.10b) |
+| 13 | Fabricated `{{step:N}}` citation appended alongside a real one, specifically on ID-like-column claims (`{{step:7}} {{step:8}}`) — 3 confirmed recurrences across separate runs | Structural (`invalid_citations` gate, §2.10c) | Confirmed fixed |
+| 14 | `compute()` called with a bare, unbracketed comprehension — `SyntaxError`, recurring across runs, wide-dataframe pattern | Structural (auto-repair, §2.9) | Confirmed fixed in production (not just isolated testing) |
+| 15 | Verifier false positive: a count and its own percentage for the same column, or a bare "step N" prose citation, both misread by `flag_internal_contradictions` as two conflicting data values | Structural (checker fix, §2.11 — bare-mention normalization; the count-vs-percentage variant remains a known but lower-priority gap) | Bare-mention variant confirmed fixed; count-vs-percentage variant logged, not yet fixed |
+| 16 | **Reopened Finding #11, precise mechanism confirmed:** `compute()` called as `value_counts(normalize=True).to_dict()` — a raw ratio, no `*100` — then the report states the percentage anyway (75.92%/24.08%), hand-multiplied outside any tool call. Confirmed on **two consecutive live runs**, both post-dating the rule-6c fix and both post-dating the class-balance coverage gate (§2.10b). The coverage gate does not catch this: it verifies *a* `value_counts` call happened, not that its output was converted compliantly. The citation gate (§2.10c) also doesn't catch it directly — it flags the resulting `{{step:N}}` mis-citation as a symptom, not the underlying hand-multiplication as the cause. | Prompt rule (6c) — **confirmed NOT holding** | **Open, actively recurring.** §5f's "resolved... treating this as closed" status was wrong; the fix's own "4/4 clean" evidence did not generalize past the batch it was measured on. Not being re-patched at the prompt level — see decision note in §5f. |
+
+**Rule 0 (explicit "branch on anomalies, don't run a fixed checklist"
+instruction) — status softened from an earlier draft of this document.**
+Multiple runs after the rule was added, and again after few-shot worked
+examples were added on top of it, show the model checking
+`(df['capital_gain']==0).mean()*100` / the equivalent for `capital_loss`
+immediately after computing skew, unprompted beyond the system prompt.
+**However:** re-checking transcripts predating the few-shot addition
+shows this same branch already happening in several of them — the
+baseline rate for this *specific* branch was already high before the
+few-shot examples were added, which means the post-few-shot successes
+are weak evidence for the few-shot fix specifically; they may just
+reflect a branch the model was rarely failing at in the first place. An
+earlier version of this document stated Rule 0 was "confirmed NOT
+reliably working" — that framing was based on limited evidence and is
+now understood to be too strong for this particular branch-case. What's
+genuinely unconfirmed either way: whether few-shot examples improve
+branching on cases the model *was* reliably missing, since no clearly-
+failing-before case has been re-checked post-fix yet. Not resolved,
+not confirmed broken — logged as an open measurement gap, see §6 item 1.
 
 ---
 
@@ -543,7 +717,7 @@ project to avoid (§5) — continuing to patch an approach after its
 failure mode has been reproduced, rather than switching approach.
 
 ### 4.5 Working fix: post-hoc structural detection
-`report_verifier.py` gained a fourth check,
+`report_verify.py` gained a fourth check,
 `flag_stale_numeric_recall(new_report_text, audit_log, boundary_index)`:
 capture `boundary_index = len(audit_log)` immediately before calling
 `continue_conversation`; afterward, any number in the new response that
@@ -590,14 +764,25 @@ enforces that it will be. See §6, item 5.
   and then failed differently on the next (Finding #6 recurred in at
   least 4 distinct concrete forms before a structural fix actually
   closed it; the `tool_choice="required"` fix looked plausible in design
-  and failed 4/4 in practice).
+  and failed 4/4 in practice). **Reconfirmed the hard way this round:**
+  the rule-6c ratio-vs-percentage fix was declared "resolved... treating
+  this as closed" after 4/4 clean follow-up runs (§5f) — and then
+  recurred on the next two runs checked after that. Four clean runs in
+  a row was treated as passing this project's own 3-strikes bar for
+  calling something durably fixed; in hindsight the batches weren't
+  independent enough evidence, and this note itself is being updated to
+  say so rather than quietly revising the earlier claim.
 - **When the same root-cause behavior resurfaces in a new concrete shape
   after a prompt patch, stop patching prompts.** Make the violation
   structurally impossible instead — a new tool (Finding #6), a stricter
   return contract (§2.4), or a deterministic checker (§4.5) — rather
   than writing another prohibition clause. Every fix in this project
   that has actually held up under adversarial re-testing has been
-  structural, not prompt-level.
+  structural, not prompt-level. The one confirmed exception to "holds
+  up" this round is rule 6c itself (Finding #16) — a prompt-level fix
+  that looked structural-adjacent (a specific, mechanical instruction
+  rather than an abstract compliance ask) but still didn't hold,
+  reinforcing rather than weakening the general rule.
 - **Distinguish severity classes explicitly:** "unverified" (no tool
   call backs this number, but it might still be correct) vs.
   "fabricated" (specific content invented with no basis) vs. "wrong" (a
@@ -618,6 +803,11 @@ enforces that it will be. See §6, item 5.
   and, separately, that even a bug-free implementation of a structural
   fix can turn out to target a constraint the model won't honor at all.
   Both possibilities need to be checked before calling something fixed.
+  **Reconfirmed this round on the coverage gate (§2.10a):** the first
+  implementation was syntactically clean and semantically well-designed
+  but simply never wired into the return path — caught only because it
+  was checked before being trusted, not because the design was reviewed
+  and looked right.
 - **`python3 -m py_compile` proves syntax, not correctness.** An edit
   accidentally dropped the `def flag_internal_contradictions(...)`
   header line while adding an unrelated helper function above it. With
@@ -627,7 +817,10 @@ enforces that it will be. See §6, item 5.
   and the break was invisible until the function was actually called
   (`NameError` in the notebook). Every edit needs its actual behavior
   re-tested, not just its syntax — a clean compile is necessary, not
-  sufficient.
+  sufficient. **Same lesson, new instance this round:** the dead
+  coverage-gate code (§2.10a) compiled cleanly and would have looked
+  identical to a working gate in a diff review; only tracing the actual
+  control flow (does `missing_coverage` get called anywhere?) caught it.
 - **A crashed reassignment leaves the old variable alive — don't mistake
   stale state for a new result.** A `RateLimitError` raised mid-call on
   `report2, audit_log, messages = continue_conversation(...)` prevented
@@ -647,12 +840,30 @@ enforces that it will be. See §6, item 5.
   the dataset down to a 12-column subset for the Finding #4 test
   specifically, rather than debug both limitations from one confounded
   run (see §6, item 1, for the column selection and reasoning).
+  **Same category of mistake nearly repeated this round with the
+  few-shot branching experiment** — post-fix runs showing correct
+  branching were initially read as evidence the few-shot fix worked,
+  before checking whether pre-fix runs already showed the same branch
+  succeeding, which they did. Confound caught before being written up
+  as a confirmed result, not after.
+- **RAG was considered and rejected for adding "EDA domain knowledge" to
+  the agent.** The domain knowledge in question (skew thresholds,
+  cardinality-based classification rules, zero-inflation handling) is
+  small, static, and doesn't change per-dataset or over time; it's
+  already encoded directly in the system prompt, which is strictly more
+  reliable than retrieving it (deterministic presence vs. a retrieval
+  step that could miss or misretrieve). No failure mode found in this
+  project's entire history was ever caused by the agent lacking domain
+  knowledge — every one was *behavioral* (fabricating, hand-deriving,
+  mis-citing, not branching). RAG doesn't address any of those. Logged
+  as a decision, not left implicit, since the question came up directly
+  and deserved a real answer rather than a reflexive no.
 
 ---
 
 ## 5b. The `{{step:N}}` Citation-Tag Convention
 
-Motivated by two converging problems: (a) every check in `report_verifier.py`
+Motivated by two converging problems: (a) every check in `report_verify.py`
 has to *guess* whether a report number traces to a real tool call via fuzzy
 matching, which is exactly where the recurring glyph/regex bugs (§2.5) keep
 originating; (b) Finding #11 (silent derived arithmetic, e.g. "≈96%" from
@@ -670,25 +881,21 @@ number just falls through to the existing whole-log checks, unchanged.
 
 **Mechanism:** when the model states a number sourced from a specific tool
 step, it appends `{{step:N}}` (N = the step index shown as `[Step N]` in
-its own conversation history). `report_verifier.py` gained:
+its own conversation history). `report_verify.py` gained:
 - `strip_citation_tags(text)` — removes tags before the existing checks
   run, so a tag's own digits are never mistaken for a second, bare
-  unverified number claim.
+  unverified number claim. **Extended this round (§2.11)** to also strip
+  bare, un-braced "step N" prose mentions, not just the `{{step:N}}`
+  form.
 - `flag_citation_mismatches(report, audit_log)` — for each tag, finds the
   nearest preceding number and does an **exact lookup** (not fuzzy pool
   matching) against the specific audit_log entry recorded under that step
   index (matched by the entry's own `"step"` field, not list position —
   `continue_conversation` entries use string steps like `"followup-0"`,
-  so position-based indexing would silently misalign). Returns two
-  distinct signals, treated as stronger than an ordinary unverified
-  number because the model asserted a specific, checkable provenance and
-  it was false:
-  - `invalid_step_refs` — cites a step index that doesn't exist in
-    `audit_log` at all (a fabricated citation).
-  - `miscited_numbers` — cites a real step, but that step's own logged
-    code/result doesn't contain a matching value.
-- `verify_report` now runs this as check [4], on the tag-stripped report
-  for checks [1]–[3] and the original (tagged) report for [4].
+  so position-based indexing would silently misalign). Returns three
+  distinct signals (see below), treated as stronger than an ordinary
+  unverified number because the model asserted a specific, checkable
+  provenance and it was false.
 
 Tested directly (not just asserted): a correctly-cited number passes and
 does not double-flag after tag-stripping; a citation to a step index that
@@ -698,15 +905,6 @@ whose actual output doesn't contain the claimed number is caught as
 pre-existing `flag_unverified_numbers` path unchanged; a full
 `verify_report` run against a mix of all three produces the expected
 combined count.
-
-**What this does not yet do:** it doesn't force the model to tag anything,
-by design (see above) — so its actual hit rate under real soft-phrasing
-conditions is still unmeasured; that's the next thing to check against a
-live transcript, not assume. It also doesn't add a `compute()` tool —
-Finding #11's underlying problem (arithmetic happening outside any tool
-call at all) is unchanged by this; a citation tag only lets you check
-whether a *stated* number matches a *cited* step, not force division to
-happen inside a logged call in the first place. Both are still open.
 
 **Update after 3 live runs:** citation adoption turned out to be high —
 the model tagged nearly every sourced number across all three runs,
@@ -729,18 +927,11 @@ invalid step ref). Verified directly against reconstructed fragments of
 the real off-by-one case (correctly downgraded) and a synthetic genuine
 fabrication (still caught as serious).
 
-**After this fix, the real signal across all three runs is consistent and
-small:** the same Finding #11 case (`incident_id` "≈96% unique", derived
-from `5050/5250` with no tool call) recurred in all three runs — correctly
-left uncited in Run 1, fabricated a citation to a nonexistent step in
-Run 2, miscited a real-but-wrong step in Run 3 — plus a handful of
-already-accepted check [2] "Recommendations section" false positives.
-No new bug *class* appeared in the underlying report or agent across
-three runs; the only new thing found was in the checker's own citation
-logic, now fixed. Per the project's own 3-strikes framing, that's the
-signal to stop tuning the checker further and treat Finding #11 (a
-`compute()`-style tool, still not built) as the one real open item on
-the report-quality side.
+**This round's structural extension (§2.10c):** `invalid_citations` now
+also runs *before* a report is even accepted by `run_eda_agent`'s own
+loop, not just after the fact in `verify_report` — closing a third
+recurrence of a fabricated second `{{step:N}}` tag on ID-column claims
+before it can ever reach a saved report at all.
 
 ## 5c. The `compute(expression)` Tool
 
@@ -766,7 +957,8 @@ with Finding #4's confirmed namespace persistence). Returns
 preserved in `audit_log`. Non-scalar results (a Series/DataFrame/array)
 get a warning appended rather than being treated as an error, nudging
 the model to refine the expression rather than silently returning
-something the report shouldn't quote directly.
+something the report shouldn't quote directly. **This round: gained a
+syntax auto-repair step for bare comprehensions — see §2.9.**
 
 **Explicitly NOT enforced.** Consistent with the §4.3-4.4 lesson and the
 citation-tag convention (§5b): no `tool_choice="required"`, nothing
@@ -774,10 +966,10 @@ blocks the model from still doing arithmetic in its head. The system
 prompt's rule 6 was generalized (previously missingness-specific) to
 name `compute()` for any other derived ratio/percentage/difference,
 using the exact `incident_id` uniqueness case as the concrete example.
-Whether the model actually reaches for it under real conditions is
-unmeasured — same status as citation-tag adoption before the 3-run test
-that measured it. That's the next thing to check against a live
-transcript, not assume from having built the tool.
+**This has a direct, confirmed consequence, not just a theoretical one —
+see Finding #16: nothing enforces that `compute()`'s output is actually
+used correctly downstream either, which is exactly the gap the
+ratio-vs-percentage recurrence exploits.**
 
 **Tested before calling it done:** a derived-percentage expression
 evaluates correctly; an expression referencing a variable defined by an
@@ -788,7 +980,9 @@ instead of dumping a raw Series into the report. End-to-end: a
 `compute()`-logged result for the exact `incident_id` uniqueness case,
 cited with `{{step:N}}`, passes `flag_citation_mismatches` cleanly — the
 whole pipeline (tool → citation → verification) closes the loop on this
-specific recurring finding, provided the model uses it.
+specific recurring finding, provided the model uses it *and* uses it
+correctly — the second half of that condition is the part now known to
+fail (Finding #16).
 
 ## 5d. Proactive Request Token-Budget Compaction
 
@@ -814,7 +1008,7 @@ was preferred over the reactive alternative:
   exception-handling time pressure -- exactly the kind of ad hoc
   heuristic that tends to become the next bug.
 - `messages` (what's sent to the model) and `audit_log` (what
-  `report_verifier.py` actually checks) are already separate structures
+  `report_verify.py` actually checks) are already separate structures
   in this codebase, confirmed by inspection -- compacting `messages`
   cannot touch `audit_log`, so it cannot make a previously-verified
   number look unverified. The one real side effect (the model can't
@@ -837,7 +1031,7 @@ never touches the system message or most recent messages) live in
 `eda_agent.py`. Called from inside `call_with_retry` itself -- the single
 function both `run_eda_agent` and `continue_conversation` already share
 -- so both call sites get the fix automatically without duplicating the
-logic into `continue_conversation_snippet.py` separately.
+logic into `continue_conversation.py` separately.
 
 Tested directly: an artificially oversized `messages` list compacts to
 under budget; the system message and most recent tool result are left
@@ -845,7 +1039,7 @@ untouched; compaction proceeds oldest-first; an already-under-budget list
 is a no-op; `call_with_retry` is confirmed (via a mock) to invoke
 compaction before every request, not just some.
 
-**Bug found and fixed while doing this:** `continue_conversation_snippet.py`
+**Bug found and fixed while doing this:** `continue_conversation.py`
 never had a dispatch branch for `compute` -- only `execute_python` and
 `missingness_report`, falling through to `"ERROR: unknown tool 'compute'."`
 for any `compute()` call attempted during a follow-up turn. The tool
@@ -887,120 +1081,171 @@ assist on top of the real fix, not as the fix itself.
 backward-compatible with every existing call site and transcript) or
 `expressions` (list, evaluated independently — one bad expression in a
 batch errors individually without losing the results of the others).
-Both dispatch sites (`eda_agent.py` and `continue_conversation_snippet.py`)
+Both dispatch sites (`eda_agent.py` and `continue_conversation.py`)
 and the tool schema were updated together, since these two files must
 stay in sync on tool support (the same class of gap as the missing
 `compute` dispatch found in §5d).
 
-Tested directly: the exact Run 17 scenario (4 `nunique()` calls)
-reproduced in one batch call; single-expression calls still work
-unchanged; a batch with one invalid expression still returns correct
-results for the valid ones; missing arguments handled cleanly;
-end-to-end, a `{{step:N}}` citation to a multi-result batched
-`compute()` call still resolves correctly through
-`flag_citation_mismatches`.
+Tested directly: the exact scenario (4 `nunique()` calls) reproduced
+in one batch call; single-expression calls still work unchanged; a
+batch with one invalid expression still returns correct results for the
+valid ones; missing arguments handled cleanly; end-to-end, a
+`{{step:N}}` citation to a multi-result batched `compute()` call still
+resolves correctly through `flag_citation_mismatches`.
 
-## 5f. Stopping-Bar Check — Result: Not Yet Met
+## 5f. Stopping-Bar Check — Original Result and Reopened Status
 
-A stopping bar was set explicitly before running the next batch (3
-transcripts, checked against: (1) no `MAX_ITERATIONS` cutoff, (2) zero
-serious issues, (3) any remaining flags are repeats of already-logged
-classes, not new ones). Applying it honestly to the batch: **not met**,
-specifically on (2).
+A stopping bar was set explicitly before running a batch of test runs
+(3 transcripts, checked against: (1) no `MAX_ITERATIONS` cutoff, (2)
+zero serious issues, (3) any remaining flags are repeats of
+already-logged classes, not new ones). Applying it honestly to that
+original batch: **not met**, specifically on (2).
 
-**All three runs have a genuine Finding #11 recurrence, in a now-precise
-shape:** `compute("df['incident_id'].nunique() / len(df)")` returns the
-raw ratio (0.9619...); the model converts it to "96.19%" / "96.2%" in
-the final report by multiplying by 100 in its head, outside any tool
-call. One earlier validated transcript shows the model CAN do this
-correctly — folding the `*100` directly into the expression
+**All three of those runs had a genuine Finding #11 recurrence, in a
+precise shape:** `compute("df['incident_id'].nunique() / len(df)")`
+returns the raw ratio (0.9619...); the model converts it to "96.19%" /
+"96.2%" in the final report by multiplying by 100 in its head, outside
+any tool call. One earlier validated transcript showed the model CAN do
+this correctly — folding the `*100` directly into the expression
 (`compute("... / len(df) * 100")`) — but doesn't do so consistently.
-This is not a new bug class (still Finding #11), but it is not resolved
-by `compute()` existing; the tool supports doing this right, the model
-just doesn't reliably choose to. One run (21) additionally never
-recomputed `nunique()` for `incident_id` as a raw count in this session
-at all, making even the underlying count unverified, not just the
-percentage conversion.
 
-**Two checker-side findings from this batch, both fixed or logged:**
-- **Fixed:** `flag_citation_mismatches` was missing the threshold-context
-  exclusion `flag_unverified_numbers` already has. `"(per rule >10)
-  {{step:2}}"` was flagged as a fabricated citation — boilerplate
-  classification-rule text the tag happened to land near, not a data
-  claim. Same `THRESHOLD_CONTEXT_RE` exclusion now applied to the
-  citation check too, tested against the exact case and a same-line
-  regression (a genuine fabrication elsewhere on the same line as a
-  threshold reference still gets caught).
-- **Logged, not fixed:** one run used `[[Step N]]` instead of the
-  specified `{{step:N}}` format — citation-convention format drift, not
-  a new correctness bug. A stray digit from `[[Step 5]]` leaked into
-  `flag_unverified_numbers` as a bare unverified "5". Consistent with
-  already-known soft-prompt-convention adherence being approximate
-  rather than exact; not chasing this reactively.
+**Fix attempted:** both the `compute()` tool schema and system prompt
+rule 6 were found inconsistent with each other — the tool's main
+description showed the uniqueness example as a bare ratio (no `*100`),
+while the `expression` parameter's own example showed it with `*100`.
+Fixed both to agree, and added an explicit new rule (6c) stating the
+exact failure mode by name: computing a ratio via `compute()` and then
+multiplying by 100 by hand afterward is the SAME violation rule 6
+already prohibits, since the multiplication itself never went through
+the tool.
 
-**Fixed:** both the `compute()` tool schema and system prompt rule 6
-were inconsistent with each other -- the tool's main description showed
-the uniqueness example as a bare ratio (no `*100`), while the
-`expression` parameter's own example showed it with `*100`. Fixed both
-to agree, and added an explicit new rule (6c) stating the exact failure
-mode by name: computing a ratio via `compute()` and then multiplying by
-100 by hand afterward is the SAME violation rule 6 already prohibits,
-since the multiplication itself never went through the tool. This is a
-narrower, more mechanical ask than the soft-compliance asks already
-confirmed to fail (§4.2-4.4) — not "verify your claim" in the abstract,
-but "put this specific operator inside the expression" — so the
-compliance risk profile is different, though unconfirmed until checked
-against a live run.
+**~~Resolved, not a limitation~~ — REOPENED. The original text here read:**
+*"Confirmed clean on 4 of 4 returned follow-up runs after the fix — zero
+recurrences of the hand-multiplication pattern across two separate
+batches... a fix confirmed working 4 times in a row is not something to
+keep re-testing; treating this as closed."* **That status was wrong, and
+is corrected here rather than silently edited away, per this project's
+own methodology note on not hiding a reversed conclusion.** Two further
+runs, checked after this document's own local-move update, both show
+the identical hand-multiplication pattern: `compute()` called as
+`value_counts(normalize=True).to_dict()` with no `*100` anywhere in the
+expression, and the report stating 75.92%/24.08% anyway. See Finding
+#16 (§3) for the full mechanism, including why the coverage/citation
+gates built afterward (§2.10) don't catch this particular failure —
+they verify a category of investigation happened, not that its output
+was used compliantly.
 
-**Decision on continued iteration:** three more runs will be checked
-against this specific fix. If a run three-peats the same ratio-vs-
-percentage gap despite the fix (i.e., a third consecutive confirmed
-failure of this exact mechanism, not just of Finding #11 in the
-abstract), log it as an accepted limitation rather than attempting a
-fourth iteration — consistent with this project's own stated 3-strikes
-rule for prompt-level fixes that don't hold.
+**Decision on further action, made explicitly rather than defaulting to
+"patch again":** not attempting a rule-6c rewording (a "6d"). Per this
+project's own 3-strikes framing, rule 6c has now failed on recurrence,
+the same threshold that has triggered a structural fix everywhere else
+in this project. The reason this one is being logged as an accepted,
+currently-open limitation rather than immediately structurally patched:
+the only structural fix that actually closes this class of gap is the
+one already scoped in §5g (structured output — a `class_balance` field
+sourced directly from a tool return that includes the percentage,
+removing the "was it converted compliantly" question entirely rather
+than checking for it after the fact). Building a narrower one-off
+structural check specifically for this single rule (e.g. extending the
+coverage gate to also verify `*100` appears inside the cited `compute()`
+call) was considered and rejected — it would fix this one instance and
+leave the next rule-6c-shaped gap uncaught, the same whack-a-mole this
+project already moved away from for the checker's own regex bugs
+(§2.5). Left open pending the §5g redesign.
+
+---
+
+## 5g. Future Direction: Structured Output Instead of Free Prose
+
+**Not built. Documented here as a deliberate design direction for a
+future phase, not a task in progress.**
+
+Every attribution false positive logged above — the range-bucket bug,
+its positional-pairing cousin, its columns-before-range mirror image —
+is the same underlying tradeoff coming due repeatedly: this project
+chose (§5b) to keep the final report as human-readable free-form
+markdown, with a citation-tag convention (`{{step:N}}`) layered on top
+as a lighter-weight compromise, rather than requiring the model to
+return literal structured data. That was a deliberate choice, not an
+oversight — it keeps the report readable without redesigning the output
+format — and these recurring false positives are its cost, paid in
+small installments across many runs rather than once up front.
+
+The actual fix for the whole category, if it's ever worth doing: the
+model returns structured claims directly —
+`{"column": "weapon_used", "missing_pct": 18.48, "source_step": 2}` —
+instead of a sentence a regex has to parse to recover that same
+information. There is no attribution ambiguity to resolve, because the
+column and its value are paired by construction, not inferred from
+proximity in prose. This is the "Option B" design considered and
+deliberately deferred earlier in this project in favor of the
+citation-tag compromise; nothing has changed about the tradeoff, it's
+just accumulated enough small cost that it's worth naming explicitly as
+a real future option rather than leaving it implicit.
+
+**Additional evidence accumulated this round, reinforcing rather than
+changing the original assessment:** the bare-"step N" false positive
+(§2.11) and — more significantly — the reopened ratio-vs-percentage gap
+(Finding #16, §5f) are both instances of the exact same underlying
+tradeoff. The ratio-vs-percentage case in particular is the clearest
+argument yet for this redesign specifically: a structured `class_balance`
+field sourced directly from a tool call that already includes the `*100`
+step makes "did the model convert this compliantly" a non-question,
+rather than something requiring an ever-growing set of checks to catch
+after the fact. This is now the strongest concrete example motivating
+§5g of anything found so far.
+
+This would be a genuine redesign (report generation, the verifier, and
+likely the prompt all change shape) — not a patch, and not something to
+bolt on reactively. If pursued, it belongs as a deliberate, scoped
+decision in its own right.
+
+---
 
 ## 6. Open Items, Priority Order
 
-1. **Genuinely stress-test namespace persistence (Finding #4)** — status
-   update: run completed. The 12-column slice produced the strongest
-   evidence yet (§3, Finding #4's multi-step skew-error investigate →
-   diagnose → fix → reverify loop) and independently re-confirmed the
-   §2.7 mutation-leak fix on the same run. This item can be considered
-   closed; see §3 and §2.7 for the evidence.
-2. **Section-scope check [2]** in `report_verifier.py` to eliminate the
-   "Recommendations" section false-positive rate. **Partially addressed:**
-   check [1]'s narrower train-test-split-ratio slice of this gap is now
-   fixed (§2.5). Check [2]'s general section-scoping problem (model
-   names, encoding schemes, etc. in a Recommendations section) is
-   unchanged and still open.
-3. **Add `qwen/qwen3-32b` as a second model** for comparison — item 1 is
-   now stable (above), so this is unblocked and ready to schedule.
-4. **Decide detect-vs-correct for Finding #9** (§4.5): leave
+1. **Design a real test for the few-shot branching question.** Current
+   evidence is confounded (§3, Rule 0 status note; §5 methodology note)
+   — post-few-shot runs show correct branching, but so do several
+   pre-few-shot runs on the same case. Need to identify a branch the
+   model was *reliably* missing before the few-shot addition, then
+   re-check that specific case post-fix. Without this, "does few-shot
+   help" remains genuinely unanswered, not answered-and-confirmed.
+2. **Structured-output redesign (§5g)** — now the strongest-motivated
+   item on this list, per Finding #16's direct demonstration of exactly
+   the gap this redesign closes. Would change the report-generation
+   contract, the verifier, and likely the prompt shape; not a patch.
+3. **Finding #16 (ratio-vs-percentage) remains open** — deliberately not
+   being patched at the prompt level again (§5f decision note); tracked
+   here as a live, accepted-for-now limitation pending item 2, not
+   forgotten.
+4. **Section-scope check [2] in `report_verify.py`** to eliminate the
+   persistent "Recommendations section" false-positive rate (technique
+   names, model names). Still open, lower priority than (1)–(3).
+5. **Dedicated test coverage for recent new code paths** —
+   `invalid_citations`, the split `class_balance` check, `compute()`'s
+   auto-repair, `BARE_STEP_MENTION_RE` — currently validated only by
+   live-run evidence and manual reproduction, not by
+   `tests/test_agent.py` or `tests/test_report_verifier.py` directly.
+   43/43 existing tests passing confirms no regression, not that these
+   specific paths have dedicated coverage.
+6. **Module split (`eda_agent.py` → `config.py`/`tools.py`/
+   `prompts.py`/`agent.py`) and CI** — still explicitly non-blocking,
+   per the original SE-phase decision. No new forcing function has
+   appeared.
+7. **Add `qwen/qwen3-32b` as a second model** for comparison — namespace
+   persistence (Finding #4) is stable, so this is unblocked and ready to
+   schedule whenever prioritized above the items above it.
+8. **Decide detect-vs-correct for Finding #9** (§4.5): leave
    `flag_stale_numeric_recall` as a manual post-hoc call, or wire it
-   into `continue_conversation` automatically — either as a loud warning
-   on flag, or as an auto-injected correction turn that forces flagged
-   columns to be re-queried before returning to the caller.
-5. **`ground_truth_summary`'s blind spot on agent-cleaned columns** — now
-   that the §2.7 mutation-leak fix keeps `df` pristine,
-   `ground_truth_summary` (which only computes stats on columns already
-   numeric-dtype in the *raw* data) structurally cannot independently
-   verify any column the agent itself converted from object to numeric
-   (e.g. a cleaned `property_loss_usd`). A stated skew for such a column
-   currently has zero independent check available — not because it's
-   wrong, but because the harness has no way to look. Open decision:
-   should `ground_truth_summary` attempt its own independent object→numeric
-   coercion (using a *different* cleaning method than whatever the agent
-   invented, so it's a genuine independent check and not just re-running
-   the agent's own fix)?
-6. **Structural fix for Finding #11** (silent unverified derived
-   arithmetic, e.g. "≈96% uniqueness" from `5050/5250` never run through
-   a tool) — now recurred a third time, which by this project's own
-   3-strikes rule (§5) is overdue for a structural fix rather than
-   another prompt patch. Open design question: what would a generic
-   "must show your arithmetic through a tool call" mechanism look like,
-   generalized beyond `missingness_report`? Biggest, least-defined item
-   on this list — do it last, with full context.
+   into `continue_conversation` automatically.
+9. **`ground_truth_summary`'s blind spot on agent-cleaned columns** —
+   now that the §2.7 mutation-leak fix keeps `df` pristine,
+   `ground_truth_summary` structurally cannot independently verify any
+   column the agent itself converted from object to numeric. Open
+   decision: should it attempt its own independent coercion using a
+   *different* method than the agent's, to stay a genuine independent
+   check?
 
 ---
 
@@ -1009,7 +1254,7 @@ rule for prompt-level fixes that don't hold.
 This project's core problem — can an agent's claims be trusted, and if not,
 how do you catch it systematically — is not a novel problem. Worth
 naming explicitly where this project sits relative to documented
-approaches, rather than treating `report_verifier.py` as an ad hoc
+approaches, rather than treating `report_verify.py` as an ad hoc
 invention.
 
 ### 7.1 The landscape
@@ -1027,7 +1272,7 @@ invention.
 
 2. **Post-hoc claim-level verification ("tool receipts")** — decompose
    output into atomic claims, check each against a structured record of
-   what tools actually returned. This is `report_verifier.py`,
+   what tools actually returned. This is `report_verify.py`,
    precisely. The published framing for this pattern models each
    verification case as a
    `(request, tool_outputs, response, ground_truth)` tuple and checks
@@ -1038,7 +1283,8 @@ invention.
    version of #2: require the model to emit structured output where
    every claim carries an explicit reference (a tool_call_id or
    audit_log index), checked by a direct registry lookup rather than
-   free-text parsing. **Not yet attempted in this project** — see §7.2.
+   free-text parsing. **Not yet attempted in this project — see §5g,
+   now the top-priority open item per §6.**
 
 4. **Self-consistency / semantic entropy sampling** — generate the same
    response multiple times, measure disagreement across samples as a
@@ -1050,7 +1296,7 @@ invention.
 5. **Separate verifier/judge model** — a second LLM (or a small
    fine-tuned classifier) whose only job is fact-checking the first
    model's output. Deliberately **not used** in this project —
-   `report_verifier.py` is zero-LLM by design, since a judge model adds
+   `report_verify.py` is zero-LLM by design, since a judge model adds
    a second thing to trust rather than removing trust from the system.
 
 6. **EDA/data-agent-specific benchmarks** — academic benchmarks exist
@@ -1058,7 +1304,7 @@ invention.
    scored on both correctness and hallucination rate), including at
    least one proposing a baseline agent architecture for the same task
    this project is doing by hand. Not yet consulted for methodology
-   ideas beyond correctness-checking — see §7.2, item 3.
+   ideas beyond correctness-checking.
 
 **Assessment:** this project independently arrived at approaches #1 and
 #2 — the two most established patterns for this problem — without
@@ -1068,9 +1314,10 @@ gap is #3: the current implementation of #2 is regex/keyword-based over
 free text (`NUMBER_RE_STRICT`, tag-matching), which is why so much of
 this project's effort has gone into fixing the checker's own parsing
 bugs (§2.5) — thousands-separator handling, dtype-digit exclusion,
-semantic-tag collisions. A structured-receipt version of #2 would not
-have those failure classes at all, because there would be no free-text
-number-hunting left to do.
+semantic-tag collisions — and, this round, why Finding #16 exists at
+all: a structured-receipt version of #2 would not have this failure
+class, because there would be no "was the arithmetic done in the tool
+call or by hand afterward" question left to ask.
 
 ### 7.2 Suggested next steps arising from this comparison
 
@@ -1088,8 +1335,15 @@ six approaches above.)*
 
 ## 8. Repository Contents
 
-- `eda_agent.py` — agent loop, tool definitions, `call_with_retry`
-- `report_verifier.py` — `flag_unverified_numbers`,
+- `eda_agent.py` — agent loop, tool definitions, `call_with_retry`,
+  the coverage/citation completion gates (§2.10)
+- `report_verify.py` — `flag_unverified_numbers`,
   `flag_unverified_tokens`, `flag_internal_contradictions`,
-  `flag_stale_numeric_recall`, `verify_report` (entry point)
-- `continue_conversation_snippet.py` — `continue_conversation`
+  `flag_stale_numeric_recall`, `flag_citation_mismatches`,
+  `verify_report` (entry point)
+- `continue_conversation.py` — `continue_conversation`
+- `main.py` — driver script; produces `full_run_report.md` and
+  `verification_details.md` (§2.8)
+- `tests/test_agent.py`, `tests/test_report_verifier.py` — 43 tests
+  total, all passing as of the most recent check-in (see §6 item 5 for
+  what this does and doesn't cover)

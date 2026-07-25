@@ -533,6 +533,23 @@ Your job:
    continuing. Two runs on different datasets should not produce the
    same tool-call sequence unless the datasets are genuinely
    equivalent in structure.
+
+   Example of CORRECT branching behavior:
+     [Step 4] You compute skewness and see capital_gain = 11.95
+     (extreme, >3). Correct next move, before writing anything about
+     this column in the report:
+       [Step 5] compute("(df['capital_gain']==0).mean()*100")
+       -> tells you WHY the skew is so extreme (e.g. 91.7% zeros)
+          before you recommend a transformation, instead of guessing.
+     INCORRECT: moving straight to item 3 (cardinality of the next
+     column) and writing a generic "consider log1p" note without
+     having checked what's actually driving the extreme value.
+
+   Example of a result that does NOT need a follow-up:
+     [Step 4] hours_per_week skew = 0.23 (near zero, unremarkable).
+     Correct next move: proceed to the next item as normal -- nothing
+     here warrants extra investigation, and manufacturing a follow-up
+     call for an unremarkable result wastes a step for no reason.
 1. Inspect shape, dtypes, missing values, and basic stats.
 2. Before interpreting skewness or applying any transformation advice,
    check df[col].nunique() for each numeric column. Columns with only 2
