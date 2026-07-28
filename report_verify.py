@@ -143,6 +143,38 @@ THRESHOLD_CONTEXT_RE = re.compile(
 # already consume the same stripped text.
 BARE_STEP_MENTION_RE = re.compile(r"\(?\bstep\s*#?\s*\d+(?:\s*,\s*\d+)*\)?", re.IGNORECASE)
 
+# Section-heading marker for the report's closing "Recommendations" /
+# "Next steps" block. This section is inherently full of standard
+# ML/stats vocabulary (log1p, SMOTE, has_gain-style flag names) that will
+# never appear verbatim in any tool's printed output -- it's advice, not
+# a data claim, and every real run so far has produced 6-8 guaranteed
+# false positives from this one section alone. Matches an optional
+# markdown heading marker (#, *, digit+period), then the heading word
+# itself, so it fires on "### Recommendations", "**7. Recommendations &
+# next steps**", "Next steps", etc. without needing an exact heading
+# format.
+RECOMMENDATIONS_HEADING_RE = re.compile(
+    r"^[\s#\*]*(?:\d+\.\s*)?"
+    r"(recommendations?(?:\s*&\s*next\s*steps)?|next\s*steps|suggested\s+next\s+steps)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_recommendations_section(text: str) -> str:
+    """Return `text` truncated right before the first recognized
+    Recommendations/Next-steps heading, if any. Everything from that
+    heading onward is advice/methodology prose, not a claim about this
+    dataset, and is excluded from token-matching (check [2]) entirely
+    rather than trying to special-case every ML term that might appear
+    in it -- the same reasoning already applied to jargon-number
+    exclusion above, scoped by section instead of by regex-per-term.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if RECOMMENDATIONS_HEADING_RE.match(line.strip()):
+            return "\n".join(lines[:i])
+    return text
+
 
 def _normalize_number_spacing(text: str) -> str:
     """Collapse space-grouped thousands (using any recognized Unicode
@@ -316,7 +348,15 @@ def flag_unverified_tokens(report: str, audit_log):
     naturally appear (they're in df.columns, which almost every run
     prints) so this mainly catches invented VALUES within columns, e.g.
     invented category labels, invented stock-status strings, etc.
+
+    The Recommendations/Next-steps section is excluded before matching
+    (see _strip_recommendations_section): it's advice/methodology prose
+    (log1p, SMOTE, has_gain-style engineered-flag names), not a claim
+    about a value observed in this dataset, and every real run so far has
+    produced several guaranteed false positives from that section alone.
     """
+    scoped_report = _strip_recommendations_section(report)
+
     audit_text = " ".join(
         (e.get("code", "") or "") + " " + (e.get("result", "") or "")
         for e in audit_log
@@ -326,8 +366,8 @@ def flag_unverified_tokens(report: str, audit_log):
     # tokens the model wrote without quotes in the audit log
     audit_words = set(re.findall(r"[A-Za-z][A-Za-z0-9_]{2,20}", audit_text))
 
-    report_tokens = set(_quoted_tokens(report))
-    report_tokens.update(_illustrative_example_phrases(report))
+    report_tokens = set(_quoted_tokens(scoped_report))
+    report_tokens.update(_illustrative_example_phrases(scoped_report))
 
     flags = []
     for tok in report_tokens:
@@ -945,14 +985,3 @@ def verify_report(report: str, audit_log, df_columns=None):
         "miscited_unverified": miscited_unverified,
         "contradictions": contradictions if df_columns is not None else None,
     }
-
-
-# ---------------------------------------------------------------------------
-# USAGE (in your notebook, right after a run):
-#
-# from report_verifier import verify_report
-# report, audit_log = run_eda_agent(df)
-# print(report)
-# ground_truth_summary(df)
-# verify_report(report, audit_log, df_columns=list(df.columns))
-# ---------------------------------------------------------------------------

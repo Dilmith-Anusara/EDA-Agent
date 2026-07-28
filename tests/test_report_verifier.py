@@ -305,3 +305,77 @@ class TestVerifyReportIntegration:
         report = "num_arrests skew = -0.60 {{step:99}}"
         result = verify_report(report, skew_audit_log, df_columns=["num_arrests"])
         assert len(result["invalid_step_refs"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# flag_unverified_tokens / Recommendations-section exclusion (this session's fix)
+# ---------------------------------------------------------------------------
+
+class TestRecommendationsSectionExclusion:
+
+    def test_ml_jargon_in_recommendations_section_not_flagged(self):
+        """Core fix: standard modeling vocabulary in a closing
+        Recommendations/Next-steps section (log1p, has_gain-style
+        engineered-flag names, SMOTE) was producing 6-8 guaranteed false
+        positives on every real run, since none of it appears verbatim
+        in any tool's printed output -- it's advice, not a data claim."""
+        report = (
+            "**7. Recommendations & next steps**\n"
+            "1. Create binary flags `has_capital_gain` and `has_capital_loss`.\n"
+            "2. Apply `log1p` to the positive values if needed.\n"
+            "3. Consider class weighting, SMOTE, or balanced subsampling.\n"
+        )
+        assert flag_unverified_tokens(report, []) == []
+
+    def test_heading_variants_all_recognized(self):
+        """The heading detector must match the different real forms seen
+        across live runs: numbered + bold ('**7. Recommendations & next
+        steps**'), plain markdown ('### Recommendations'), and bare
+        ('Next steps'), not just one exact spelling."""
+        for heading in (
+            "**7. Recommendations & next steps**",
+            "### Recommendations",
+            "Next steps",
+            "### Next Steps",
+        ):
+            report = f"{heading}\n1. Use `log1p` on skewed columns.\n"
+            assert flag_unverified_tokens(report, []) == [], f"failed for heading: {heading!r}"
+
+    def test_fabrication_before_the_heading_is_still_caught(self):
+        """Regression guard: the fix must only exclude text AFTER the
+        heading. A fabricated category invented earlier in the report
+        (not in the Recommendations section) must still be flagged --
+        the fix must not blind check [2] to genuine fabrications
+        elsewhere in the report."""
+        report = (
+            "**2. Missing values**\n"
+            "The `workclass` column contains the invented category "
+            "\"Freelance-Remote\" per our analysis.\n\n"
+            "**7. Recommendations & next steps**\n"
+            "1. Consider `log1p` transforms for skewed columns.\n"
+        )
+        flags = flag_unverified_tokens(report, [])
+        assert any("Freelance-Remote" in f for f in flags)
+        assert not any("log1p" in f for f in flags)
+
+    def test_fabrication_inside_recommendations_section_is_now_invisible(self):
+        """This is the accepted tradeoff, stated explicitly rather than
+        left implicit: a genuinely fabricated VALUE (not just jargon)
+        that happens to be written inside the Recommendations section
+        will no longer be caught by this check. The section is assumed
+        to be advice, not data claims -- known and intentional, not an
+        oversight."""
+        report = (
+            "**7. Recommendations & next steps**\n"
+            "1. The `workclass` column's rare category \"Freelance-Remote\" "
+            "should be grouped into 'Other'.\n"
+        )
+        assert flag_unverified_tokens(report, []) == []
+
+    def test_no_recommendations_heading_present_behaves_as_before(self):
+        """A report with no Recommendations section at all must not have
+        its behavior changed -- _strip_recommendations_section should be
+        a no-op when there's nothing to strip."""
+        report = 'The dataset contains an invented category "Freelance-Remote".'
+        flags = flag_unverified_tokens(report, [])
+        assert any("Freelance-Remote" in f for f in flags)

@@ -19,6 +19,7 @@ Run with:
 import os
 os.environ.setdefault("GROQ_API_KEY", "dummy-key-for-tests")
 
+import json
 from unittest.mock import patch
 import pandas as pd
 import numpy as np
@@ -173,7 +174,17 @@ class TestCompute:
 
 class TestTokenBudgetCompaction:
 
-    def _build_oversized_messages(self, n_tool_results=20, result_size=2000):
+    def _build_oversized_messages(self, n_tool_results=20, result_size=300):
+        # result_size tuned down from 2000 -- REQUEST_TOKEN_BUDGET was
+        # tightened (5500 -> 4000) and _estimate_tokens' divisor tightened
+        # (4 -> 2) after a live crash showed the old settings were ~2x too
+        # generous for this JSON-heavy payload shape (see eda_agent.py).
+        # 2000 chars/result under the new settings compacts ALL 20 tool
+        # messages including the most recent one, which would make
+        # test_system_message_and_most_recent_tool_result_preserved's
+        # invariant untestable in this fixture, not actually false in
+        # general -- 300 keeps this test exercising real compaction while
+        # leaving enough headroom for the newest tool result to survive.
         messages = [{"role": "system", "content": "You are an EDA agent." * 50}]
         for i in range(n_tool_results):
             messages.append({
@@ -538,3 +549,98 @@ class TestRunEdaAgentCoverageGateWiring:
                       and "fabricated" in m.get("content", "")]
         assert len(corrective) == 1
         assert "[99]" in corrective[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Token-estimate divisor fix + graceful degradation on unrecoverable
+# rate-limit/size errors (live crash, 2026-07)
+# ---------------------------------------------------------------------------
+
+class TestTokenEstimateDivisorFix:
+
+    def test_estimate_uses_divisor_two_not_four(self):
+        """Regression guard for the crash: a live request compacted to an
+        estimated <=5500 tokens under the OLD divide-by-4 estimate was
+        actually 8546-10678 real tokens per Groq -- roughly 2.0-2.6 real
+        chars/token, not 4. Confirm the estimate now uses the tighter
+        divisor, not just that some number comes back."""
+        text = "x" * 1000
+        messages = [{"role": "user", "content": text}]
+        # json.dumps adds quoting/braces overhead; check the ratio, not
+        # an exact byte count, so this doesn't break if json overhead
+        # shifts slightly.
+        estimate = agent._estimate_tokens(messages)
+        raw_len = len(json.dumps(messages))
+        assert estimate == raw_len // 2
+
+    def test_budget_is_tightened_to_4000(self):
+        """REQUEST_TOKEN_BUDGET was reduced from 5500 -- compaction only
+        ever rewrites tool-role content, so the system prompt, tool
+        schemas, and assistant/user messages need real headroom under
+        Groq's 8000 TPM cap, not just under the old, too-generous
+        estimate."""
+        assert agent.REQUEST_TOKEN_BUDGET <= 4000
+
+
+class TestGracefulDegradationOnRateLimitError:
+
+    def test_persistent_rate_limit_error_returns_partial_results_not_crash(self, sample_df):
+        """Core fix for the live crash: a rate_limit_exceeded/'Request
+        too large' error that survives all of call_with_retry's retries
+        must not propagate as a bare exception and kill the whole run --
+        it must return whatever audit_log/messages already exist, the
+        same graceful-degradation contract MAX_ITERATIONS already has."""
+
+        class FakeRateLimitError(Exception):
+            body = {"error": {"code": "rate_limit_exceeded",
+                               "message": "Request too large for model ..."}}
+
+        # First call succeeds (a real tool call), second call raises the
+        # unrecoverable error -- confirms partial progress is preserved.
+        good_message = _FakeMessage(tool_calls=[
+            _FakeToolCall("c1", "missingness_report", '{"col": "suspect_age"}'),
+        ])
+        responses = [_FakeResponse(good_message)]
+
+        call_count = {"n": 0}
+
+        def side_effect(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return responses[0]
+            raise FakeRateLimitError()
+
+        with patch.object(agent, "call_with_retry", side_effect=side_effect):
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        assert "rate-limit" in report.lower() or "request-size" in report.lower()
+        # The one real tool call made before the crash must be preserved,
+        # not lost.
+        assert len(audit_log) == 1
+        assert audit_log[0]["code"] == "missingness_report(col='suspect_age')"
+
+    def test_tool_use_failed_errors_are_unaffected_by_this_change(self, sample_df):
+        """Regression guard: the new rate-limit branch must not swallow
+        or short-circuit the existing tool_use_failed salvage path --
+        that path must still take priority and still `continue` the loop
+        rather than returning early."""
+
+        class FakeToolUseFailedError(Exception):
+            body = {"error": {"code": "tool_use_failed",
+                               "failed_generation": '{"code": "print(1)"}'}}
+
+        final_report = _FakeMessage(content="Done.")
+
+        call_count = {"n": 0}
+
+        def side_effect(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise FakeToolUseFailedError()
+            return _FakeResponse(final_report)
+
+        with patch.object(agent, "call_with_retry", side_effect=side_effect):
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        # Salvaged code must have actually run and been logged.
+        assert any(e["code"] == "print(1)" for e in audit_log)

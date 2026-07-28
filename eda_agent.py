@@ -71,15 +71,36 @@ MAX_ITERATIONS = 15
 # and call_with_retry's existing sleep-and-retry already handles it). This
 # budget is deliberately conservative (well under 8000) to leave headroom
 # for completion tokens and other usage sharing the same window.
-REQUEST_TOKEN_BUDGET = 5500
+#
+# Confirmed live crash (2026-07): with the OLD divide-by-4 estimate and a
+# 5500 budget, Groq reported ACTUAL requests of 8546 and 10678 tokens --
+# 1.5-2x over both the estimate and the hard cap -- meaning compaction was
+# leaving the request oversized every time, retries hit the identical 413
+# three times, and call_with_retry re-raised uncaught (no other exception
+# handler in run_eda_agent catches a plain rate-limit/size error), crashing
+# the whole process mid-run with nothing saved. Root cause: 4 chars/token
+# is an English-prose assumption. This payload is mostly JSON (tool
+# schemas, tool-call arguments, numeric results) -- reconstructing the
+# ratio from that crash's own numbers gives ~2.0-2.6 real chars/token, not
+# 4. REQUEST_TOKEN_BUDGET is also tightened, since compaction only ever
+# rewrites tool-role message content -- it can't shrink the system prompt,
+# the tool schemas, or the assistant/user messages that make up a growing
+# share of every request as a run progresses.
+REQUEST_TOKEN_BUDGET = 4000
 
 
 def _estimate_tokens(messages) -> int:
-    """Rough token estimate (~4 characters per token for English text and
-    JSON structure). Not exact tokenization -- good enough to catch 'this
-    request is clearly oversized' before sending, not meant to match
-    Groq's own tokenizer precisely."""
-    return len(json.dumps(messages)) // 4
+    """Rough token estimate. Not exact tokenization -- good enough to
+    catch 'this request is clearly oversized' before sending, not meant
+    to match Groq's own tokenizer precisely.
+
+    Divisor is 2, not the more common ~4-chars-per-token English-prose
+    rule of thumb -- confirmed too generous for this payload by a live
+    413 crash (see REQUEST_TOKEN_BUDGET's comment above): JSON structure,
+    numeric literals, and repeated key/schema names tokenize far more
+    densely than prose, and the old divisor underestimated actual usage
+    by roughly 1.5-2x on the exact request that crashed."""
+    return len(json.dumps(messages)) // 2
 
 
 def _compact_messages_to_budget(messages, budget=REQUEST_TOKEN_BUDGET):
@@ -726,6 +747,35 @@ def run_eda_agent(df: pd.DataFrame, verbose: bool = True):
                         ),
                     })
                     continue
+
+            # A sustained rate-limit/oversized-request error (Groq 413
+            # "Request too large" or 429 "rate_limit_exceeded" that
+            # survives all retries) cannot be fixed by retrying again --
+            # same reasoning call_with_retry's own docstring already
+            # gives for why compaction runs BEFORE sending, not after
+            # failing. Confirmed live: this used to propagate as a bare
+            # `raise`, uncaught by anything in this function or in
+            # main.py, killing the process with NO output file written
+            # at all -- audit_log and messages existed only in-memory
+            # and were lost, even though several real, verified tool
+            # calls had already run this session. Return the partial
+            # state instead of crashing, so a caller (e.g. main.py) can
+            # still write verification_details.md from whatever ran
+            # before the failure, exactly as MAX_ITERATIONS' own
+            # "ran out, here's what we have" return already does below.
+            if error_code == "rate_limit_exceeded" or "rate_limit_exceeded" in str(e) \
+                    or "Request too large" in str(e):
+                if verbose:
+                    print(f"\n[Step {step}] Unrecoverable rate-limit/size "
+                          f"error after retries -- returning partial "
+                          f"results instead of crashing:\n{e}")
+                return (
+                    f"Run stopped early at step {step} due to a persistent "
+                    f"rate-limit/request-size error -- inspect audit_log "
+                    f"for what was verified before the failure.",
+                    audit_log,
+                    messages,
+                )
             raise
 
         choice = response.choices[0]
