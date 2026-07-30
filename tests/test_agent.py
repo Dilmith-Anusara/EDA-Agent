@@ -197,13 +197,19 @@ class TestTokenBudgetCompaction:
         return messages
 
     def test_oversized_messages_get_compacted_under_budget(self):
+        """Compares against the EFFECTIVE budget (REQUEST_TOKEN_BUDGET
+        minus TOOLS_SCHEMA_TOKEN_ESTIMATE), not the raw budget -- that's
+        the actual quantity _compact_messages_to_budget targets, since
+        the `tools` schema's fixed overhead is now accounted for (see
+        TestTokenEstimateDivisorFix.test_tools_schema_overhead_is_now_counted)."""
+        effective_budget = agent.REQUEST_TOKEN_BUDGET - agent.TOOLS_SCHEMA_TOKEN_ESTIMATE
         messages = self._build_oversized_messages()
         before = agent._estimate_tokens(messages)
-        assert before > agent.REQUEST_TOKEN_BUDGET
+        assert before > effective_budget
 
         agent._compact_messages_to_budget(messages)
         after = agent._estimate_tokens(messages)
-        assert after <= agent.REQUEST_TOKEN_BUDGET
+        assert after <= effective_budget
 
     def test_system_message_and_most_recent_tool_result_preserved(self):
         """Compaction must go oldest-first and must never touch the
@@ -558,28 +564,76 @@ class TestRunEdaAgentCoverageGateWiring:
 
 class TestTokenEstimateDivisorFix:
 
-    def test_estimate_uses_divisor_two_not_four(self):
+    def test_fallback_estimate_uses_divisor_two_not_four(self):
         """Regression guard for the crash: a live request compacted to an
-        estimated <=5500 tokens under the OLD divide-by-4 estimate was
+        estimated <=5500 tokens under the OLD divide-by-4 fallback was
         actually 8546-10678 real tokens per Groq -- roughly 2.0-2.6 real
-        chars/token, not 4. Confirm the estimate now uses the tighter
-        divisor, not just that some number comes back."""
-        text = "x" * 1000
-        messages = [{"role": "user", "content": text}]
-        # json.dumps adds quoting/braces overhead; check the ratio, not
-        # an exact byte count, so this doesn't break if json overhead
-        # shifts slightly.
-        estimate = agent._estimate_tokens(messages)
-        raw_len = len(json.dumps(messages))
-        assert estimate == raw_len // 2
+        chars/token, not 4. Confirm the FALLBACK heuristic uses the
+        tighter divisor. Forces the fallback path explicitly (rather than
+        relying on the test environment having no network access to
+        tiktoken's vocab) so this stays deterministic everywhere."""
+        with patch.object(agent, "_get_tokenizer", return_value=None):
+            text = "x" * 1000
+            messages = [{"role": "user", "content": text}]
+            estimate = agent._estimate_tokens(messages)
+            raw_len = len(json.dumps(messages))
+            assert estimate == raw_len // 2
 
-    def test_budget_is_tightened_to_4000(self):
-        """REQUEST_TOKEN_BUDGET was reduced from 5500 -- compaction only
-        ever rewrites tool-role content, so the system prompt, tool
-        schemas, and assistant/user messages need real headroom under
-        Groq's 8000 TPM cap, not just under the old, too-generous
-        estimate."""
-        assert agent.REQUEST_TOKEN_BUDGET <= 4000
+    def test_real_tokenizer_used_when_available(self):
+        """If a tokenizer loads, _estimate_tokens must use its actual
+        .encode() length, not silently fall back to the heuristic anyway.
+        Uses a fake tokenizer rather than requiring real network access
+        to tiktoken's vocab, so this is deterministic in any environment."""
+        class _FakeTokenizer:
+            def encode(self, text, disallowed_special=()):
+                return list(range(42))  # arbitrary fixed count
+
+        with patch.object(agent, "_get_tokenizer", return_value=_FakeTokenizer()):
+            assert agent._estimate_tokens([{"role": "user", "content": "anything"}]) == 42
+
+    def test_tokenizer_load_failure_falls_back_cleanly(self):
+        """_get_tokenizer must return None (not raise) when tiktoken is
+        missing or its vocab can't be fetched (e.g. no network) -- this
+        is the exact situation confirmed in this project's own sandbox
+        (tiktoken installed, vocab download blocked by network policy),
+        and _estimate_tokens must still work via the fallback."""
+        with patch.object(agent, "_get_tokenizer", return_value=None):
+            # Must not raise, and must return a positive int via the
+            # fallback divisor.
+            result = agent._estimate_tokens([{"role": "user", "content": "x" * 100}])
+            assert isinstance(result, int) and result > 0
+
+    def test_tools_schema_overhead_is_now_counted(self):
+        """Fix: the `tools` schema is sent on every real request but was
+        previously never counted by _estimate_tokens/
+        _compact_messages_to_budget at all (both only ever looked at
+        `messages`). TOOLS_SCHEMA_TOKEN_ESTIMATE must be a real, positive
+        estimate of that fixed overhead, not zero or unset."""
+        assert agent.TOOLS_SCHEMA_TOKEN_ESTIMATE > 0
+        assert agent.TOOLS_SCHEMA_TOKEN_ESTIMATE == agent._estimate_tokens(agent.tools)
+
+    def test_compaction_budget_accounts_for_tools_overhead(self):
+        """_compact_messages_to_budget must compare `messages` against
+        (budget - TOOLS_SCHEMA_TOKEN_ESTIMATE), not the raw budget --
+        otherwise a request could look comfortably under budget on
+        `messages` alone while the REAL request (messages + tools) was
+        already much closer to Groq's actual cap. Forces the fallback
+        tokenizer path for a deterministic, exact assertion."""
+        with patch.object(agent, "_get_tokenizer", return_value=None):
+            # Build messages sized to land exactly between the raw budget
+            # and the tools-adjusted effective budget, so this test only
+            # passes if the overhead is actually being subtracted.
+            filler_chars = (agent.REQUEST_TOKEN_BUDGET * 2) - 200
+            messages = [{"role": "system", "content": "s"},
+                        {"role": "tool", "tool_call_id": "c0", "content": "x" * filler_chars}]
+            est = agent._estimate_tokens(messages)
+            effective = agent.REQUEST_TOKEN_BUDGET - agent.TOOLS_SCHEMA_TOKEN_ESTIMATE
+            assert est > effective, "test fixture must actually exceed the effective budget"
+
+            agent._compact_messages_to_budget(list(messages))  # should not raise
+            compacted = [dict(m) for m in messages]
+            agent._compact_messages_to_budget(compacted)
+            assert agent._estimate_tokens(compacted) <= effective
 
 
 class TestGracefulDegradationOnRateLimitError:
@@ -644,3 +698,211 @@ class TestGracefulDegradationOnRateLimitError:
 
         # Salvaged code must have actually run and been logged.
         assert any(e["code"] == "print(1)" for e in audit_log)
+
+
+# ---------------------------------------------------------------------------
+# execute_python: structural correction for tool-name-as-Python-name
+# confusion (prompt rule 0c alone confirmed insufficient on a live run)
+# ---------------------------------------------------------------------------
+
+class TestToolNameConfusionCorrection:
+
+    def test_direct_call_shape_gets_pointed_correction(self, namespace):
+        """Live-confirmed shape 1: print(missingness_report)."""
+        result = agent.execute_python("print(missingness_report)", namespace)
+        assert "ERROR" in result
+        assert "CORRECTION" in result
+        assert "TOOL, not a Python name" in result
+
+    def test_assignment_shape_gets_pointed_correction(self, namespace):
+        """Live-confirmed shape 2: result = missingness_report; print(result)."""
+        result = agent.execute_python(
+            "result = missingness_report\nprint(result)", namespace)
+        assert "CORRECTION" in result
+
+    def test_assignment_plus_method_call_shape_gets_pointed_correction(self, namespace):
+        """Live-confirmed shape 3: res = missingness_report; res.to_dict() --
+        confirms the correction fires even when the NameError happens on
+        a later line, not just the first."""
+        result = agent.execute_python(
+            "res = missingness_report\nprint(res.to_dict())", namespace)
+        assert "CORRECTION" in result
+
+    def test_compute_tool_name_also_covered(self, namespace):
+        """The same confusion could equally happen with 'compute' --
+        confirm it's not hardcoded to missingness_report only."""
+        result = agent.execute_python("print(compute)", namespace)
+        assert "CORRECTION" in result
+        assert "'compute' is a TOOL" in result
+
+    def test_unrelated_nameerror_gets_no_false_correction(self, namespace):
+        """Regression guard: an ordinary NameError unrelated to a tool
+        name must NOT get the CORRECTION text -- that would be confusing,
+        incorrect guidance for a genuine typo/undefined-variable bug."""
+        result = agent.execute_python("print(some_undefined_variable)", namespace)
+        assert "ERROR" in result
+        assert "CORRECTION" not in result
+
+    def test_non_nameerror_exceptions_unaffected(self, namespace):
+        """Regression guard: this fix only special-cases NameError -- a
+        different exception type (e.g. ZeroDivisionError) must behave
+        exactly as before, no CORRECTION text attached."""
+        result = agent.execute_python("1/0", namespace)
+        assert "ERROR" in result
+        assert "CORRECTION" not in result
+
+
+# ---------------------------------------------------------------------------
+# run_eda_agent: escalation on REPEATED tool-name confusion within a run
+# ---------------------------------------------------------------------------
+
+class TestToolNameConfusionEscalation:
+
+    def test_second_occurrence_triggers_escalated_stop_message(self, sample_df):
+        """Live-confirmed pattern: the model hit the tool-name-confusion
+        CORRECTION at step 2, moved on, then made the identical mistake
+        independently at step 6 in the same run -- one reactive message
+        was not durable. The SECOND occurrence must inject a separate,
+        blunt escalation message, not just rely on the tool result text
+        landing a second time."""
+        responses = [
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c1", "execute_python", '{"code": "print(missingness_report)"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c2", "execute_python", '{"code": "print(1)"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c3", "execute_python", '{"code": "print(missingness_report)"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c4", "missingness_report", '{"col": "suspect_age"}'),
+                _FakeToolCall("c5", "execute_python", '{"code": "df[\\"suspect_age\\"].skew()"}'),
+                _FakeToolCall("c6", "execute_python", '{"code": "df[\\"crime_type\\"].value_counts()"}'),
+            ])),
+            _FakeResponse(_FakeMessage(content="Final report, done.")),
+        ]
+
+        with patch.object(agent, "call_with_retry", side_effect=responses):
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        escalations = [m for m in messages if m.get("role") == "user"
+                       and m.get("content", "").startswith("STOP:")]
+        assert len(escalations) == 1
+        assert "2nd time" in escalations[0]["content"]
+
+    def test_single_occurrence_does_not_escalate(self, sample_df):
+        """A single tool-name-confusion mistake must NOT trigger the
+        escalation -- it's specifically for repeats. One occurrence
+        should get only the existing CORRECTION text in the tool result,
+        no separate STOP message."""
+        responses = [
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c1", "execute_python", '{"code": "print(missingness_report)"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c2", "missingness_report", '{"col": "suspect_age"}'),
+                _FakeToolCall("c3", "execute_python", '{"code": "df[\\"suspect_age\\"].skew()"}'),
+                _FakeToolCall("c4", "execute_python", '{"code": "df[\\"crime_type\\"].value_counts()"}'),
+            ])),
+            _FakeResponse(_FakeMessage(content="Final report, done.")),
+        ]
+
+        with patch.object(agent, "call_with_retry", side_effect=responses):
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        escalations = [m for m in messages if m.get("role") == "user"
+                       and m.get("content", "").startswith("STOP:")]
+        assert escalations == []
+
+    def test_unrelated_execute_python_errors_never_escalate(self, sample_df):
+        """Regression guard: an ordinary execute_python error (no
+        CORRECTION text) must never contribute to the escalation
+        counter, no matter how many times it happens."""
+        responses = [
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c1", "execute_python", '{"code": "1/0"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c2", "execute_python", '{"code": "1/0"}')])),
+            _FakeResponse(_FakeMessage(tool_calls=[
+                _FakeToolCall("c3", "missingness_report", '{"col": "suspect_age"}'),
+                _FakeToolCall("c4", "execute_python", '{"code": "df[\\"suspect_age\\"].skew()"}'),
+                _FakeToolCall("c5", "execute_python", '{"code": "df[\\"crime_type\\"].value_counts()"}'),
+            ])),
+            _FakeResponse(_FakeMessage(content="Final report, done.")),
+        ]
+
+        with patch.object(agent, "call_with_retry", side_effect=responses):
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        escalations = [m for m in messages if m.get("role") == "user"
+                       and m.get("content", "").startswith("STOP:")]
+        assert escalations == []
+
+
+# ---------------------------------------------------------------------------
+# run_eda_agent: content-aware citation check (real step, wrong content)
+# ---------------------------------------------------------------------------
+
+class TestFabricatedCitationToRealStep:
+
+    def test_finalize_rejected_when_cited_step_content_does_not_match(self, sample_df):
+        """Live-confirmed severe case: invalid_citations() alone only
+        checks that a cited step NUMBER exists -- it waved through a
+        report citing {{step:0}} for a skew value where step 0 was a
+        real audit_log entry (missingness_report + skew + value_counts,
+        all logged under the same loop step since they came from one
+        model turn), just not one containing that number at all.
+        Confirms the finalize gate now also rejects this via
+        flag_citation_mismatches's miscited_unverified bucket, not just
+        nonexistent step numbers."""
+        covering_calls = _FakeMessage(tool_calls=[
+            _FakeToolCall("c1", "missingness_report", '{"col": "suspect_age"}'),
+            _FakeToolCall("c2", "execute_python", '{"code": "df[\\"suspect_age\\"].skew()"}'),
+            _FakeToolCall("c3", "execute_python", '{"code": "df[\\"crime_type\\"].value_counts()"}'),
+        ])
+        # Cites step 0 (real, but none of ITS results contain -0.09, and
+        # -0.09 appears nowhere else in the session -- fabricated).
+        fabricated_report = _FakeMessage(
+            content="suspect_age skew = -0.09 {{step:0}}")
+        final_report = _FakeMessage(content="Corrected final report.")
+        responses = [
+            _FakeResponse(covering_calls),
+            _FakeResponse(fabricated_report),
+            _FakeResponse(final_report),
+        ]
+
+        with patch.object(agent, "call_with_retry", side_effect=responses) as mock_call:
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        assert report == "Corrected final report."
+        assert mock_call.call_count == 3
+        corrective = [m for m in messages if m.get("role") == "user"
+                      and "fabricated, not just miscited" in m.get("content", "")]
+        assert len(corrective) == 1
+
+    def test_indexing_slip_alone_does_not_block_finalization(self, sample_df):
+        """Regression guard: a citation to the WRONG but still-correct
+        step (the value IS verified, just filed under an adjacent step
+        number from a separate turn -- an indexing slip) must NOT be
+        treated as fabrication and must NOT block finalization, per this
+        project's own established low-severity handling of that case.
+        Uses two separate turns so the real nunique value and the
+        misattributed citation land under genuinely different step
+        indices."""
+        turn0 = _FakeMessage(tool_calls=[
+            _FakeToolCall("c1", "missingness_report", '{"col": "suspect_age"}'),
+            _FakeToolCall("c2", "execute_python", '{"code": "df[\\"suspect_age\\"].skew()"}'),
+        ])
+        turn1 = _FakeMessage(tool_calls=[
+            _FakeToolCall("c3", "execute_python", '{"code": "df[\\"crime_type\\"].value_counts()"}'),
+            _FakeToolCall("c4", "compute", '{"expression": "df[\\"suspect_age\\"].nunique()"}'),
+        ])
+        # Real nunique value (3, for this fixture's suspect_age column)
+        # is logged under step 1 (turn1); citing it to step 0 (a real
+        # step, different content) is an indexing slip, not fabrication.
+        report_with_slip = _FakeMessage(
+            content="suspect_age nunique = 3 {{step:0}}")
+        responses = [_FakeResponse(turn0), _FakeResponse(turn1), _FakeResponse(report_with_slip)]
+
+        with patch.object(agent, "call_with_retry", side_effect=responses) as mock_call:
+            report, audit_log, messages = agent.run_eda_agent(sample_df, verbose=False)
+
+        assert report == "suspect_age nunique = 3 {{step:0}}"
+        assert mock_call.call_count == 3

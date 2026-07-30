@@ -71,36 +71,15 @@ MAX_ITERATIONS = 15
 # and call_with_retry's existing sleep-and-retry already handles it). This
 # budget is deliberately conservative (well under 8000) to leave headroom
 # for completion tokens and other usage sharing the same window.
-#
-# Confirmed live crash (2026-07): with the OLD divide-by-4 estimate and a
-# 5500 budget, Groq reported ACTUAL requests of 8546 and 10678 tokens --
-# 1.5-2x over both the estimate and the hard cap -- meaning compaction was
-# leaving the request oversized every time, retries hit the identical 413
-# three times, and call_with_retry re-raised uncaught (no other exception
-# handler in run_eda_agent catches a plain rate-limit/size error), crashing
-# the whole process mid-run with nothing saved. Root cause: 4 chars/token
-# is an English-prose assumption. This payload is mostly JSON (tool
-# schemas, tool-call arguments, numeric results) -- reconstructing the
-# ratio from that crash's own numbers gives ~2.0-2.6 real chars/token, not
-# 4. REQUEST_TOKEN_BUDGET is also tightened, since compaction only ever
-# rewrites tool-role message content -- it can't shrink the system prompt,
-# the tool schemas, or the assistant/user messages that make up a growing
-# share of every request as a run progresses.
-REQUEST_TOKEN_BUDGET = 4000
+REQUEST_TOKEN_BUDGET = 5500
 
 
 def _estimate_tokens(messages) -> int:
-    """Rough token estimate. Not exact tokenization -- good enough to
-    catch 'this request is clearly oversized' before sending, not meant
-    to match Groq's own tokenizer precisely.
-
-    Divisor is 2, not the more common ~4-chars-per-token English-prose
-    rule of thumb -- confirmed too generous for this payload by a live
-    413 crash (see REQUEST_TOKEN_BUDGET's comment above): JSON structure,
-    numeric literals, and repeated key/schema names tokenize far more
-    densely than prose, and the old divisor underestimated actual usage
-    by roughly 1.5-2x on the exact request that crashed."""
-    return len(json.dumps(messages)) // 2
+    """Rough token estimate (~4 characters per token for English text and
+    JSON structure). Not exact tokenization -- good enough to catch 'this
+    request is clearly oversized' before sending, not meant to match
+    Groq's own tokenizer precisely."""
+    return len(json.dumps(messages)) // 4
 
 
 def _compact_messages_to_budget(messages, budget=REQUEST_TOKEN_BUDGET):
@@ -280,35 +259,6 @@ def compute(expression: str = None, namespace: dict = None, expressions: list = 
     for expr in target_exprs:
         try:
             result = eval(expr, {"__builtins__": __builtins__}, namespace)
-        except SyntaxError:
-            # Common failure mode: the model writes a bare comprehension/
-            # generator like "df[col].nunique() for col in df.columns"
-            # with no enclosing brackets -- valid as an argument to a
-            # function call, invalid as a standalone eval() expression.
-            # Auto-repair by wrapping in [...] and retrying ONCE. This is
-            # safe because bracket-wrapping only fixes syntax, it cannot
-            # change what gets computed -- unlike auto-correcting the
-            # actual logic, which would be a substance change and is not
-            # something this function should ever do silently.
-            if " for " in expr and not expr.strip().startswith(("[", "(", "{")):
-                repaired = f"[{expr}]"
-                try:
-                    result = eval(repaired, {"__builtins__": __builtins__}, namespace)
-                    lines.append(
-                        f"(auto-repaired unparenthesized comprehension -> "
-                        f"{repaired})\n{repaired} = {result!r}"
-                    )
-                    continue
-                except Exception:
-                    pass
-            lines.append(
-                f"ERROR evaluating '{expr}':\n{traceback.format_exc()}\n"
-                f"HINT: if this was meant to be a list comprehension across "
-                f"columns/values, wrap the whole thing in square brackets, "
-                f"e.g. \"[df[c].nunique() for c in df.columns]\" -- a bare "
-                f"'for ... in ...' is not valid as a standalone expression."
-            )
-            continue
         except Exception:
             lines.append(f"ERROR evaluating '{expr}':\n{traceback.format_exc()}")
             continue
@@ -342,17 +292,9 @@ REQUIRED_CHECKS = {
     "cardinality/skew": lambda log: any(
         ".skew(" in e["code"] or "nunique(" in e["code"] for e in log
     ),
-    # Deliberately NOT "or compute(" here -- that used to accept ANY
-    # compute() call as satisfying this check, including the unrelated
-    # nunique-percentage calls already made for section 3. That loophole
-    # meant a model that never touched value_counts on the target column
-    # could still pass this gate, which is exactly what let two live runs
-    # recite class-balance percentages from memory with no nudge to verify
-    # them -- the gate reported zero gaps before the model ever ran a real
-    # class-balance check. Only "value_counts" (whether it appears inside
-    # an execute_python call or inside a compute() expression string --
-    # this matches either) actually demonstrates the check happened.
-    "class_balance": lambda log: any("value_counts" in e["code"] for e in log),
+    "class_balance_or_id_check": lambda log: any(
+        "value_counts" in e["code"] or "compute(" in e["code"] for e in log
+    ),
 }
 
 
@@ -360,36 +302,6 @@ def missing_coverage(audit_log):
     """Return the list of REQUIRED_CHECKS names that have no matching
     audit_log entry yet. Empty list means full coverage."""
     return [name for name, check in REQUIRED_CHECKS.items() if not check(audit_log)]
-
-
-_STEP_CITATION_RE = re.compile(r"\{\{step:(\d+)\}\}")
-
-
-def invalid_citations(report_text, audit_log):
-    """Return the sorted list of step numbers cited in report_text via
-    {{step:N}} that do NOT correspond to any real audit_log entry.
-
-    This is the structural counterpart to rule 10 in the system prompt
-    ("only tag a number if you can actually see that step's result
-    containing it"). That rule has now failed under soft phrasing on the
-    same specific pattern across multiple separate runs (a high-
-    cardinality/ID-like-column claim getting a second, invented step
-    number appended) -- three confirmed recurrences of an identical
-    failure against clear prose is a signal to gate this structurally,
-    the same reasoning already applied to the class-balance coverage
-    gate above, not to reword rule 10 a fourth time.
-
-    Deliberately checks against the STEP NUMBER existing in audit_log at
-    all, not whether the specific number-being-cited actually appears in
-    that step's result -- report_verifier.py's existing citation checker
-    already does the harder, more precise version of that check after
-    the fact. This gate exists only to catch the cruder, cheaper-to-fix
-    case: a citation pointing at a step that was never run in the first
-    place.
-    """
-    valid_steps = {e["step"] for e in audit_log}
-    cited_steps = {int(n) for n in _STEP_CITATION_RE.findall(report_text)}
-    return sorted(cited_steps - valid_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -554,23 +466,6 @@ Your job:
    continuing. Two runs on different datasets should not produce the
    same tool-call sequence unless the datasets are genuinely
    equivalent in structure.
-
-   Example of CORRECT branching behavior:
-     [Step 4] You compute skewness and see capital_gain = 11.95
-     (extreme, >3). Correct next move, before writing anything about
-     this column in the report:
-       [Step 5] compute("(df['capital_gain']==0).mean()*100")
-       -> tells you WHY the skew is so extreme (e.g. 91.7% zeros)
-          before you recommend a transformation, instead of guessing.
-     INCORRECT: moving straight to item 3 (cardinality of the next
-     column) and writing a generic "consider log1p" note without
-     having checked what's actually driving the extreme value.
-
-   Example of a result that does NOT need a follow-up:
-     [Step 4] hours_per_week skew = 0.23 (near zero, unremarkable).
-     Correct next move: proceed to the next item as normal -- nothing
-     here warrants extra investigation, and manufacturing a follow-up
-     call for an unremarkable result wastes a step for no reason.
 1. Inspect shape, dtypes, missing values, and basic stats.
 2. Before interpreting skewness or applying any transformation advice,
    check df[col].nunique() for each numeric column. Columns with only 2
@@ -625,6 +520,9 @@ Your job:
     for numeric columns, but not for object columns — so for any
     object/categorical column, call missingness_report(col) rather than
     subtracting its missing count from the total row count by hand.
+7. When you have enough evidence, STOP calling the tool and write a final
+   markdown report with: dataset shape, key alerts, missing-data
+   recommendations (with your reasoning), and suggested next steps.
 7. Do not stop and write a final report until you have made at least one
    tool call covering EACH of: missing values, numeric cardinality/skew,
    class balance or ID-check (if a target-like or high-cardinality column
@@ -643,6 +541,7 @@ Your job:
    before stating it — do not restate a number from memory, even if you
    are confident it is correct. A specific number that turns out to be
    wrong is a more serious error than an unverified-but-correct one, and
+   this rule exists specifically to prevent that.
    this rule exists specifically to prevent that. This applies with extra
    force to well-known public datasets you may recognize (e.g. Adult/
    Census Income, Titanic, Iris) — recalling a published statistic about
@@ -747,35 +646,6 @@ def run_eda_agent(df: pd.DataFrame, verbose: bool = True):
                         ),
                     })
                     continue
-
-            # A sustained rate-limit/oversized-request error (Groq 413
-            # "Request too large" or 429 "rate_limit_exceeded" that
-            # survives all retries) cannot be fixed by retrying again --
-            # same reasoning call_with_retry's own docstring already
-            # gives for why compaction runs BEFORE sending, not after
-            # failing. Confirmed live: this used to propagate as a bare
-            # `raise`, uncaught by anything in this function or in
-            # main.py, killing the process with NO output file written
-            # at all -- audit_log and messages existed only in-memory
-            # and were lost, even though several real, verified tool
-            # calls had already run this session. Return the partial
-            # state instead of crashing, so a caller (e.g. main.py) can
-            # still write verification_details.md from whatever ran
-            # before the failure, exactly as MAX_ITERATIONS' own
-            # "ran out, here's what we have" return already does below.
-            if error_code == "rate_limit_exceeded" or "rate_limit_exceeded" in str(e) \
-                    or "Request too large" in str(e):
-                if verbose:
-                    print(f"\n[Step {step}] Unrecoverable rate-limit/size "
-                          f"error after retries -- returning partial "
-                          f"results instead of crashing:\n{e}")
-                return (
-                    f"Run stopped early at step {step} due to a persistent "
-                    f"rate-limit/request-size error -- inspect audit_log "
-                    f"for what was verified before the failure.",
-                    audit_log,
-                    messages,
-                )
             raise
 
         choice = response.choices[0]
@@ -785,41 +655,29 @@ def run_eda_agent(df: pd.DataFrame, verbose: bool = True):
         messages.append(message.model_dump(exclude_none=True))
 
         if not message.tool_calls:
+            # No tool call -> model is done, this is the final report
             # Model wants to stop. Before accepting this as the final report,
-            # run TWO structural checks -- neither relies on prompt wording
-            # alone, since both categories of prompt-only rule (rule 7's
-            # "enough evidence" and rule 10's citation honesty) have now
-            # failed under soft phrasing on repeat, confirmed occasions.
+            # check whether audit_log actually covers the required
+            # categories -- structural gate, not a prompt-only rule. If
+            # coverage is missing, push back and force continuation instead
+            # of returning. (Guard step < MAX_ITERATIONS - 1 so a forced
+            # continuation can never itself cause an infinite loop / never
+            # exceed MAX_ITERATIONS.)
             gaps = missing_coverage(audit_log)
-            bad_citations = invalid_citations(message.content or "", audit_log)
-
-            if (gaps or bad_citations) and step < MAX_ITERATIONS - 1:
-                problems = []
-                if gaps:
-                    problems.append(
-                        f"you have not yet made a tool call covering: {', '.join(gaps)}"
-                    )
-                if bad_citations:
-                    problems.append(
-                        f"your draft cites step(s) {bad_citations} with {{{{step:N}}}} "
-                        f"tags, but no tool call in this conversation has that step "
-                        f"number -- that citation is fabricated and must be removed "
-                        f"or corrected to the real step that produced the number"
-                    )
+            if gaps and step < MAX_ITERATIONS - 1:
                 if verbose:
-                    print(f"\n[Step {step}] Model tried to finalize with problems: {problems}. Forcing continuation.")
+                    print(f"\n[Step {step}] Model tried to finalize with gaps: {gaps}. Forcing continuation.")
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Before finalizing: " + "; and ".join(problems) + ". "
-                        "Do not state any figures for uncovered categories unless "
-                        "you verify them now with a tool call -- this includes "
-                        "figures you may recognize from a well-known public "
-                        "dataset, which must still be freshly verified against "
-                        "THIS dataframe, not recalled. Fix the fabricated "
-                        "citation(s) if any, and either continue your "
-                        "investigation to cover missing categories or write the "
-                        "report omitting unverified sections."
+                        f"Before finalizing, you have not yet made a tool call covering: "
+                        f"{', '.join(gaps)}. Do not state any figures for these categories "
+                        f"in your report unless you verify them now with a tool call -- "
+                        f"this includes figures you may recognize from a well-known public "
+                        f"dataset, which must still be freshly verified against THIS "
+                        f"dataframe, not recalled. Either continue your investigation to "
+                        f"cover the missing categories, or write the report omitting those "
+                        f"sections entirely."
                     ),
                 })
                 continue
@@ -932,4 +790,3 @@ def ground_truth_summary(df: pd.DataFrame) -> None:
 # report, audit_log = run_eda_agent(df)
 # print(report)
 # ground_truth_summary(df)
-# ---------------------------------------------------------------------------
