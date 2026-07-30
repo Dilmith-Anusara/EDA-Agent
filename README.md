@@ -1347,3 +1347,164 @@ six approaches above.)*
 - `tests/test_agent.py`, `tests/test_report_verifier.py` — 43 tests
   total, all passing as of the most recent check-in (see §6 item 5 for
   what this does and doesn't cover)
+---
+
+## 9. Session Update — Evaluation Phase Closed (Reverted to Pre-Session Agent)
+
+**Status: the report-accuracy evaluation loop (§5–§6) is deliberately
+closed, not abandoned mid-work.** After this session's fixes, the agent
+kept surfacing new, narrower instances of already-known failure
+categories rather than new categories — the signal this project's own
+framework (below) says means "stop hardening, not keep hardening."
+`eda_agent.py` has been reverted to the pre-this-session version (the
+one predating items 9.2–9.6 below). This section exists so that
+reversion isn't mistaken for the fixes never having existed, or for
+their causes being unclear.
+
+### 9.1 The stopping decision, and the framework behind it
+
+Established mid-session, applied here rather than stopping on a mood:
+a phase like this closes when (a) every known *failure category*
+(not instance) has a structural gate, not just a prompt reword; (b) the
+new-category rate has genuinely dropped — new sessions surface narrower
+instances of known categories, not new categories; (c) every open item
+is named and triaged (fix-now vs. accept-and-monitor), not just
+"pending"; (d) a burn-in run confirms it. By the end of this session:
+(a) was true for 5 of 6 identified categories (see §9.6); (b) had
+dropped to zero new categories across the last several runs; (c) is
+satisfied by this section; (d) was never fully run (quota-limited), and
+is exactly the kind of task not worth resuming — see §9.7.
+
+### 9.2 Fixes made this session (present in the reverted-FROM version,
+absent in the reverted-TO version — listed for provenance, not as a
+call to re-apply them)
+
+- **Live crash fix**: `_estimate_tokens`'s `//4` heuristic was ~2x too
+  generous for this JSON-heavy payload (confirmed live: an estimated
+  ≤5500-token request was actually 8546–10678 real tokens per Groq).
+  Root-caused further mid-session: the `tools` schema was never counted
+  by the estimate at all (a real, separate gap), and a flat divisor
+  applied uniformly to prose (`SYSTEM_PROMPT`) and JSON (tool results)
+  is inherently imprecise for either. Fixed via a tiktoken-first
+  estimate with graceful heuristic fallback, tools-schema accounting,
+  and a `run_eda_agent` return contract for unrecoverable rate-limit
+  errors (partial results instead of an uncaught crash). **Confirmed
+  structural ceiling, not fully resolved even by this fix**: under the
+  fallback heuristic alone (no tiktoken/network), `SYSTEM_PROMPT` +
+  `tools` + accumulating assistant-role tool-call stubs (never
+  compacted — only tool-role results are) can approach the real 8000
+  cap by ~step 5, regardless of the budget number chosen, since
+  compaction structurally cannot shrink assistant messages.
+- **report_verify.py: Recommendations-section false positives** — check
+  [2] was flagging 6-8 issues on every real run, all standard ML
+  vocabulary (`log1p`, `SMOTE`, `has_gain`-style flag names) in a
+  heading-delimited closing section. Fixed via section-exclusion.
+  **Confirmed narrower gap surfaced after the fix**: the same
+  vocabulary recurs as false positives when a report uses a **markdown
+  table** instead of a heading-delimited section — the fix doesn't
+  generalize to that layout. Not fixed; tracked in §9.6.
+- **Tool-name-confusion structural correction + escalation** — the
+  model repeatedly referenced `missingness_report`/`compute` as Python
+  names inside `execute_python` (confirmed: 2-3 occurrences per run,
+  across multiple independent runs). A prompt-only rule (0c) was tried
+  first and confirmed insufficient (recurred despite the rule). Fixed
+  with a two-part structural response: (1) `execute_python` returns a
+  pointed `CORRECTION:` in the error text on the exact `NameError`
+  shape; (2) `run_eda_agent` counts recurrences and escalates with a
+  blunt `STOP:` user-role message from the 2nd occurrence onward. Live
+  transcripts after this fix show the pattern being contained (2 wasted
+  steps, then self-correction) rather than derailing the whole run —
+  the strongest positive behavioral evidence this session produced, on
+  two consecutive real runs.
+- **Live citation-fabrication catch, closing a real live/offline gate
+  asymmetry** — `invalid_citations()` (the in-loop gate) only checked
+  that a cited step *number* existed in `audit_log`, not whether that
+  step's *content* supported the claim. A live run cited `{{step:3}}`
+  for completely invented skew values (real skew: 0.56/1.45/4.59;
+  claimed: -0.09/3.62/2.31) where step 3 was a real, unrelated
+  `missingness_report` call — waved through by the live gate, caught
+  correctly but only post-hoc by `report_verify.py`'s
+  `flag_citation_mismatches()`. Fixed by importing and running that
+  same, stronger check in-loop, so this class of fabrication now forces
+  continuation before the report is ever finalized, not just flagged
+  after the fact.
+
+### 9.3 Confirmed NOT the cause of the redundant-tool-call /
+tool-name-confusion pattern, despite initial suspicion
+
+A live burn-in run showed heavy redundant re-querying (df.shape/dtypes/
+columns queried repeatedly) immediately after this session's
+token-budget edit, raising a real, tested hypothesis that early,
+over-aggressive compaction was wiping the model's view of its own
+step-0 result. Directly disproven: the identical redundant-querying and
+tool-name-confusion pattern was reproduced on the **unmodified,
+pre-session** `eda_agent.py` (older settings, no tools-schema
+accounting, no tiktoken) in a controlled comparison. This is inherent
+`gpt-oss-120b` behavior under this system prompt, not a regression from
+any code change made this session — stated here explicitly so it isn't
+re-litigated from scratch in a future session.
+
+### 9.4 A live, unresolved verifier gap found in this session's last
+real transcript (not yet fixed — the point at which evaluation
+deliberately stopped)
+
+A report stated "all columns are fully populated (0% missing)" —
+directly contradicted by the very same session's own step-0
+`missingness_report` output (`workclass` 5.64% missing, `occupation`
+5.66%, `native_country` 1.79%). `verify_report()` did not catch this,
+for two compounding reasons: (1) the model abandoned the `{{step:N}}`
+tag format for bare prose ("see Step 1"), which `strip_citation_tags`
+deliberately ignores rather than verifies, by design (built to avoid
+double-flagging rare stray mentions — not built to be the primary
+citation path for an entire report); (2) `flag_unverified_numbers`
+structurally exempts any bare integer under 1.0 with no decimal point,
+which silently exempts "0%" — a specific, checkable claim — from ever
+being checked, for any column, in any report. Both are real, scoped,
+one-time fixes (not "chasing this report's content") — deliberately
+left unfixed as the point where continued evaluation was called a
+worse use of time than shipping the fix. Left here for whoever resumes
+this project, if anyone does.
+
+### 9.5 Explicit decision: reverted to the pre-session `eda_agent.py`
+
+The version now in place is the one pasted into this chat as "the EDA
+agent I had before" — predating every fix in §9.2. This was a
+deliberate call, not a loss of nerve: report-writing accuracy from an
+LLM that both computes and narrates numbers in the same free-text
+output has no achievable "done" state, and continuing to patch that
+architecture was assessed as lower-value than either stopping or
+redesigning (§9.7). If resumed on the current architecture, §9.2's
+fixes are all independently re-derivable from this section plus the
+session transcript, not lost.
+
+### 9.6 Updated category-closure count (see original §6 framework)
+
+Failure categories with a structural gate as of session end: fabrication
+(citation-content check, §9.2), hand-derivation (compute()/
+missingness_report split), self-contradiction (flag_internal_
+contradictions), stale recall (flag_stale_numeric_recall), tool-name
+confusion (correction + escalation, §9.2). **Without** a structural gate:
+iteration-budget management (redundant querying burns MAX_ITERATIONS
+before required checks complete) — behavioral, not a number-accuracy
+problem, and the honest assessment is a prompt/code fix for this
+specific model's habits is a diminishing-returns chase, not a closable
+gate the way the others were.
+
+### 9.7 Recommended architecture, if this project is ever resumed
+
+Not a patch on the current design — a different shape, discussed at
+length at session close: separate the agent into (1) a deterministic
+analysis core (pure Python, pandas → a typed/JSON structure of every
+computed fact — missingness, cardinality, skew, class balance, ID
+candidates — zero LLM involvement, fully unit-testable without any API
+key), and (2) an optional, tightly-scoped LLM narration layer that
+receives the *already-computed* structure and only writes prose
+commentary — it never computes or restates a number itself; numbers are
+inserted into the final report by template/formatter code, not typed by
+the model. This eliminates the entire class of problems this project
+spent most of its effort fighting (fabrication, hand-derivation,
+citation mismatches, the ratio-vs-percentage gap in Finding #16) by
+construction, rather than by an ever-growing set of checks — the same
+conclusion §7's prior-art review (approach #3, "constrained output
+schema") already pointed to, now stated as the concrete next design if
+picked back up, not left as a citation to the literature.
