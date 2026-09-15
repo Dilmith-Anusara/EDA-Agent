@@ -196,6 +196,7 @@ class TestTokenBudgetCompaction:
                               "content": "x" * result_size})
         return messages
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_oversized_messages_get_compacted_under_budget(self):
         """Compares against the EFFECTIVE budget (REQUEST_TOKEN_BUDGET
         minus TOOLS_SCHEMA_TOKEN_ESTIMATE), not the raw budget -- that's
@@ -273,10 +274,12 @@ class TestExtractCodeFromToolUseError:
 
 class TestMissingCoverage:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_empty_log_flags_all_three_checks(self):
         gaps = agent.missing_coverage([])
         assert set(gaps) == {"missingness", "cardinality/skew", "class_balance"}
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_unrelated_compute_call_does_not_satisfy_class_balance(self):
         """Regression test for the fixed loophole: originally ANY
         compute() call satisfied this check, including an unrelated
@@ -332,11 +335,13 @@ class TestMissingCoverage:
 
 class TestInvalidCitations:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_citation_to_real_step_is_valid(self):
         log = [{"step": 4, "code": "df['x'].skew()", "result": "..."}]
         report = "x skew = -0.60 {{step:4}}"
         assert agent.invalid_citations(report, log) == []
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_citation_to_nonexistent_step_is_invalid(self):
         """Core case this gate was added for: a fabricated second
         {{step:N}} tag on an ID-column claim, where that step number
@@ -345,15 +350,18 @@ class TestInvalidCitations:
         report = "id column is high-cardinality {{step:7}} {{step:8}}"
         assert agent.invalid_citations(report, log) == [8]
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_multiple_invalid_citations_all_reported_sorted(self):
         log = [{"step": 1, "code": "", "result": ""}]
         report = "a {{step:9}} b {{step:3}} c {{step:1}}"
         assert agent.invalid_citations(report, log) == [3, 9]
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_no_citations_returns_empty_list(self):
         log = [{"step": 1, "code": "", "result": ""}]
         assert agent.invalid_citations("No citations in this text at all.", log) == []
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_empty_audit_log_any_citation_is_invalid(self):
         """No tool calls at all yet -- any {{step:N}} tag is necessarily
         fabricated, since nothing has run."""
@@ -366,6 +374,7 @@ class TestInvalidCitations:
 
 class TestComputeAutoRepair:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_bare_comprehension_gets_wrapped_and_evaluated(self, namespace):
         """Core fix: the model kept passing a bare, unbracketed
         comprehension to compute(), which is invalid as a standalone
@@ -391,6 +400,7 @@ class TestComputeAutoRepair:
         assert "auto-repaired" not in result
         assert "= [3]" in result
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_batch_mode_auto_repairs_individual_bad_expressions(self, namespace):
         """The auto-repair must apply per-expression inside a batch, not
         require the whole batch to be well-formed."""
@@ -528,6 +538,7 @@ class TestRunEdaAgentCoverageGateWiring:
         assert "missingness" in corrective[0]["content"]
         assert "class_balance" in corrective[0]["content"]
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_fabricated_citation_on_finalize_is_rejected(self, sample_df):
         """Step 0: model finalizes with full coverage (so missing_coverage
         is clean) but cites a step number that was never run. The
@@ -564,6 +575,7 @@ class TestRunEdaAgentCoverageGateWiring:
 
 class TestTokenEstimateDivisorFix:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_fallback_estimate_uses_divisor_two_not_four(self):
         """Regression guard for the crash: a live request compacted to an
         estimated <=5500 tokens under the OLD divide-by-4 fallback was
@@ -579,6 +591,7 @@ class TestTokenEstimateDivisorFix:
             raw_len = len(json.dumps(messages))
             assert estimate == raw_len // 2
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_real_tokenizer_used_when_available(self):
         """If a tokenizer loads, _estimate_tokens must use its actual
         .encode() length, not silently fall back to the heuristic anyway.
@@ -591,6 +604,7 @@ class TestTokenEstimateDivisorFix:
         with patch.object(agent, "_get_tokenizer", return_value=_FakeTokenizer()):
             assert agent._estimate_tokens([{"role": "user", "content": "anything"}]) == 42
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_tokenizer_load_failure_falls_back_cleanly(self):
         """_get_tokenizer must return None (not raise) when tiktoken is
         missing or its vocab can't be fetched (e.g. no network) -- this
@@ -603,6 +617,7 @@ class TestTokenEstimateDivisorFix:
             result = agent._estimate_tokens([{"role": "user", "content": "x" * 100}])
             assert isinstance(result, int) and result > 0
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_tools_schema_overhead_is_now_counted(self):
         """Fix: the `tools` schema is sent on every real request but was
         previously never counted by _estimate_tokens/
@@ -612,6 +627,7 @@ class TestTokenEstimateDivisorFix:
         assert agent.TOOLS_SCHEMA_TOKEN_ESTIMATE > 0
         assert agent.TOOLS_SCHEMA_TOKEN_ESTIMATE == agent._estimate_tokens(agent.tools)
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_compaction_budget_accounts_for_tools_overhead(self):
         """_compact_messages_to_budget must compare `messages` against
         (budget - TOOLS_SCHEMA_TOKEN_ESTIMATE), not the raw budget --
@@ -638,6 +654,7 @@ class TestTokenEstimateDivisorFix:
 
 class TestGracefulDegradationOnRateLimitError:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_persistent_rate_limit_error_returns_partial_results_not_crash(self, sample_df):
         """Core fix for the live crash: a rate_limit_exceeded/'Request
         too large' error that survives all of call_with_retry's retries
@@ -707,6 +724,7 @@ class TestGracefulDegradationOnRateLimitError:
 
 class TestToolNameConfusionCorrection:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_direct_call_shape_gets_pointed_correction(self, namespace):
         """Live-confirmed shape 1: print(missingness_report)."""
         result = agent.execute_python("print(missingness_report)", namespace)
@@ -714,12 +732,14 @@ class TestToolNameConfusionCorrection:
         assert "CORRECTION" in result
         assert "TOOL, not a Python name" in result
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_assignment_shape_gets_pointed_correction(self, namespace):
         """Live-confirmed shape 2: result = missingness_report; print(result)."""
         result = agent.execute_python(
             "result = missingness_report\nprint(result)", namespace)
         assert "CORRECTION" in result
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_assignment_plus_method_call_shape_gets_pointed_correction(self, namespace):
         """Live-confirmed shape 3: res = missingness_report; res.to_dict() --
         confirms the correction fires even when the NameError happens on
@@ -728,6 +748,7 @@ class TestToolNameConfusionCorrection:
             "res = missingness_report\nprint(res.to_dict())", namespace)
         assert "CORRECTION" in result
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_compute_tool_name_also_covered(self, namespace):
         """The same confusion could equally happen with 'compute' --
         confirm it's not hardcoded to missingness_report only."""
@@ -758,6 +779,7 @@ class TestToolNameConfusionCorrection:
 
 class TestToolNameConfusionEscalation:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_second_occurrence_triggers_escalated_stop_message(self, sample_df):
         """Live-confirmed pattern: the model hit the tool-name-confusion
         CORRECTION at step 2, moved on, then made the identical mistake
@@ -842,6 +864,7 @@ class TestToolNameConfusionEscalation:
 
 class TestFabricatedCitationToRealStep:
 
+    @pytest.mark.skip(reason="Tests code from d06e8a8-reverted session fixes (README Section 9.5) -- eda_agent.py no longer has this functionality")
     def test_finalize_rejected_when_cited_step_content_does_not_match(self, sample_df):
         """Live-confirmed severe case: invalid_citations() alone only
         checks that a cited step NUMBER exists -- it waved through a
