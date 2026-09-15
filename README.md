@@ -1508,3 +1508,79 @@ construction, rather than by an ever-growing set of checks — the same
 conclusion S7's prior-art review (approach #3, "constrained output
 schema") already pointed to, now stated as the concrete next design if
 picked back up, not left as a citation to the literature.
+
+---
+
+## 10. Project Closed — 2026-09-15
+
+**Status: this project is deliberately closed here, not abandoned
+mid-task.** This section exists for the same reason S9 does — so a
+stopping point is stated explicitly, with its reasoning, rather than
+left to be inferred from a repo that simply stops getting commits.
+
+### 10.1 Why closed here
+
+The original objective (see the top of this document) was exploratory,
+not product-oriented: understand what an autonomous, tool-calling
+"agentic" system actually is and where it actually breaks, by building
+one and adversarially testing it — not ship a production-accurate EDA
+tool. That objective is met. This document is the evidence: a working
+tool-calling agent loop, a reproduced and diagnosed set of hallucination
+failure modes (fabrication, hand-derivation, stale recall, citation
+mismatch), a zero-LLM post-hoc verification methodology built to catch
+them, and — the part that doesn't show up in a findings table — direct,
+repeated, personal confirmation of S5's own methodology note: prompt-level
+fixes against an LLM that both computes and narrates in free text do not
+hold, no matter how carefully worded, once a failure mode has recurred
+enough times to be a pattern rather than an accident. That conclusion was
+reached analytically at the end of S9. It was reached the same way a
+second time, independently, by the author actually living through the
+"small tweak, still wrong next run" cycle S9.1's stopping framework was
+written to name. Two independent arrivals at the same wall is not a
+reason to keep pushing on the wall.
+
+S9.7 already scoped the only fix that structurally closes that wall: split
+into a deterministic, zero-LLM analysis core plus a narration-only LLM
+layer that never computes or restates a number itself. That is a genuine
+redesign, not a patch — report generation, the verifier, and the prompt
+all change shape — and undertaking it now, under a real time constraint
+that does not allow for "months and months" of further iteration, would
+repeat the exact mistake S5's methodology notes already warn against:
+continuing to invest in an approach after its actual cost has been
+directly experienced, rather than stopping on the evidence already in
+hand. Not doing S9.7 now is not a verdict that S9.7 is wrong — it remains
+the correct next step if this project is ever resumed, exactly as scoped.
+It is a decision that finishing it isn't the best use of a bounded amount
+of remaining time, weighed against the objective already having been met.
+
+### 10.2 Final repository state at closing
+
+- Reorganized into `llm_agent/` (the tool-calling agent + zero-LLM
+  verifier described throughout S1–S9, in the state S9.5 reverted it to)
+  and `analysis_core/` (the S9.7 redesign's Phase 0 scaffolding —
+  `contracts.py`'s `Finding` dataclass and the report-to-check mapping —
+  left exactly as far as it got, not carried further).
+- `analysis_core/checks/` exists as an empty, ready-to-fill package: the
+  concrete starting point if S9.7 is ever picked back up, so resuming
+  doesn't require re-deriving where to start.
+- The 23 tests covering session fixes reverted in commit `d06e8a8` (see
+  S9.5) are marked `@pytest.mark.skip(reason=...)`, not deleted. They're
+  a complete, accurate record of functionality that was built, tested,
+  and confirmed working before being reverted — deleting them would
+  erase evidence this document already argues should be kept (S5: "never
+  hide a reversed conclusion").
+- `pyproject.toml` and a root `conftest.py` were added so the test suite
+  and package imports resolve correctly regardless of which directory
+  they're invoked from — verified directly, not assumed, from three
+  directories deep.
+- Test suite at closing: 62 passed, 23 skipped (with reason), 0 failed.
+
+### 10.3 If this is ever resumed
+
+Start at S9.7 and S6 item 2. The concrete first step is already named:
+one function per `Finding` type in `analysis_core/checks/` (shape,
+missingness, cardinality, skewness, describe, value_counts — the exact
+list in `analysis_core/contracts.py`'s `PHASE_0_MAPPING`), each pure
+pandas in, typed `Finding`(s) out, zero LLM, unit-testable without an API
+key. The narration layer — the part that actually touches an LLM again —
+comes after the facts layer is trustworthy on its own, not before.
