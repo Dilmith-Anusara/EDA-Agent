@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eda-agent"
+version = "0.1.0"
+description = "Autonomous EDA agent (llm_agent) plus a deterministic, zero-LLM analysis core (analysis_core) under active redesign."
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["llm_agent", "analysis_core", "analysis_core.checks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

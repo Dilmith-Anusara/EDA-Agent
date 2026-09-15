@@ -8,12 +8,12 @@ each test method's docstring says which finding/fix it comes from, so
 this file also serves as a regression record.
 
 Run with:
-    pytest tests/test_report_verify.py -v
+    pytest tests/llm_agent/test_report_verifier.py -v
 """
 
 import pytest
 
-from report_verify import (
+from llm_agent.report_verify import (
     flag_unverified_numbers,
     flag_unverified_tokens,
     flag_internal_contradictions,

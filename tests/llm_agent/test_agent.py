@@ -13,7 +13,7 @@ import to succeed, since eda_agent.py constructs a Groq client at
 import time. No real key or network access is needed to run these tests.
 
 Run with:
-    pytest tests/test_agent.py -v
+    pytest tests/llm_agent/test_agent.py -v
 """
 
 import os
@@ -25,7 +25,7 @@ import pandas as pd
 import numpy as np
 import pytest
 
-import eda_agent as agent
+import llm_agent.eda_agent as agent
 
 
 # ---------------------------------------------------------------------------

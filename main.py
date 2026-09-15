@@ -20,6 +20,7 @@ Requires GROQ_API_KEY to already be set as an environment variable
 """
 
 import io
+import os
 import contextlib
 from datetime import datetime
 
@@ -27,9 +28,9 @@ import pandas as pd
 from rich.console import Console
 from rich.markdown import Markdown
 
-from eda_agent import run_eda_agent, ground_truth_summary
-from continue_conversation import continue_conversation
-from report_verify import verify_report, flag_stale_numeric_recall
+from llm_agent.eda_agent import run_eda_agent, ground_truth_summary
+from llm_agent.continue_conversation import continue_conversation
+from llm_agent.report_verify import verify_report, flag_stale_numeric_recall
 
 console = Console()
 
@@ -200,19 +201,21 @@ def main():
     # --- 6. Assemble the analyst-facing report: banner + report, nothing else
     report_sections.insert(0, ("Agent Report", f"{banner}\n\n{report}"))
 
+    os.makedirs("outputs", exist_ok=True)
+
     full_report_doc = build_document("EDA Agent Report", report_sections)
-    with open("full_run_report.md", "w", encoding="utf-8") as f:
+    with open("outputs/full_run_report.md", "w", encoding="utf-8") as f:
         f.write(full_report_doc)
 
     detail_doc = build_document("Verification Details (audit trail)", detail_sections)
-    with open("verification_details.md", "w", encoding="utf-8") as f:
+    with open("outputs/verification_details.md", "w", encoding="utf-8") as f:
         f.write(detail_doc)
 
     # Terminal: show the analyst-facing view by default.
     display_section("Agent Report", f"{banner}\n\n{report}")
     console.print(
-        "\n[dim]Full report saved to full_run_report.md — "
-        "raw verification detail saved to verification_details.md[/dim]"
+        "\n[dim]Full report saved to outputs/full_run_report.md — "
+        "raw verification detail saved to outputs/verification_details.md[/dim]"
     )
 
 
